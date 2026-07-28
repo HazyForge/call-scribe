@@ -302,6 +302,15 @@ struct DiscordCaptureHandler {
 }
 
 #[cfg(feature = "discord")]
+#[derive(Debug, Eq, PartialEq)]
+enum CaptureTransition {
+    Keep,
+    Start(ChannelId),
+    Stop,
+    Restart(ChannelId),
+}
+
+#[cfg(feature = "discord")]
 #[derive(Clone)]
 struct ActiveCapture {
     session_id: String,
@@ -1120,29 +1129,36 @@ impl DiscordCaptureHandler {
 
         let desired_channel = self.desired_capture_channel(guild_id);
 
-        let active = {
+        let active_channel = {
             self.active
                 .lock()
                 .expect("active capture mutex poisoned")
-                .clone()
+                .as_ref()
+                .filter(|active| active.guild_id == guild_id)
+                .map(|active| active.channel_id)
         };
 
-        if let Some(active) = active
-            && active.guild_id == guild_id
-        {
-            if desired_channel == Some(active.channel_id) {
-                return;
+        match capture_transition(active_channel, desired_channel) {
+            CaptureTransition::Keep => {}
+            CaptureTransition::Start(channel_id) => {
+                if let Err(err) = self.start_capture(ctx, guild_id, channel_id).await {
+                    eprintln!("failed to start Discord capture: {err:#}");
+                }
             }
-            if let Err(err) = self.stop_capture(ctx, guild_id).await {
-                eprintln!("failed to stop Discord capture: {err:#}");
-                return;
+            CaptureTransition::Stop => {
+                if let Err(err) = self.stop_capture(ctx, guild_id).await {
+                    eprintln!("failed to stop Discord capture: {err:#}");
+                }
             }
-        }
-
-        if let Some(channel_id) = desired_channel
-            && let Err(err) = self.start_capture(ctx, guild_id, channel_id).await
-        {
-            eprintln!("failed to start Discord capture: {err:#}");
+            CaptureTransition::Restart(channel_id) => {
+                if let Err(err) = self.stop_capture(ctx, guild_id).await {
+                    eprintln!("failed to stop Discord capture: {err:#}");
+                    return;
+                }
+                if let Err(err) = self.start_capture(ctx, guild_id, channel_id).await {
+                    eprintln!("failed to start Discord capture: {err:#}");
+                }
+            }
         }
     }
 
@@ -1345,6 +1361,20 @@ impl DiscordCaptureHandler {
             stopped_at,
             wav_paths,
         }))
+    }
+}
+
+#[cfg(feature = "discord")]
+fn capture_transition(
+    active_channel: Option<ChannelId>,
+    desired_channel: Option<ChannelId>,
+) -> CaptureTransition {
+    match (active_channel, desired_channel) {
+        (None, None) => CaptureTransition::Keep,
+        (Some(active), Some(desired)) if active == desired => CaptureTransition::Keep,
+        (None, Some(channel_id)) => CaptureTransition::Start(channel_id),
+        (Some(_), None) => CaptureTransition::Stop,
+        (Some(_), Some(channel_id)) => CaptureTransition::Restart(channel_id),
     }
 }
 
@@ -2734,5 +2764,71 @@ mod tests {
             .voice_states
             .insert((guild_id, trigger_user_id), None);
         assert_eq!(handler.desired_capture_channel(guild_id), None);
+    }
+
+    #[cfg(feature = "discord")]
+    #[tokio::test]
+    async fn join_leave_rejoin_leave_during_start_requests_stop() {
+        let guild_id = GuildId::new(1);
+        let channel_id = ChannelId::new(2);
+        let participant_user_id = UserId::new(3);
+        let handler = discord_capture_handler_for_test(Some(channel_id), None);
+        handler
+            .voice_states
+            .insert((guild_id, participant_user_id), Some(channel_id));
+
+        let starting_reconcile = handler.reconcile_gate.lock().await;
+        handler
+            .voice_states
+            .insert((guild_id, participant_user_id), None);
+        handler
+            .voice_states
+            .insert((guild_id, participant_user_id), Some(channel_id));
+        let waiting_handler = handler.clone();
+        let final_leave = tokio::spawn(async move {
+            waiting_handler
+                .voice_states
+                .insert((guild_id, participant_user_id), None);
+            let _waiting_reconcile = waiting_handler.reconcile_gate.lock().await;
+            capture_transition(
+                Some(channel_id),
+                waiting_handler.desired_capture_channel(guild_id),
+            )
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!final_leave.is_finished());
+        drop(starting_reconcile);
+        assert_eq!(
+            final_leave.await.expect("leave task panicked"),
+            CaptureTransition::Stop
+        );
+    }
+
+    #[cfg(feature = "discord")]
+    #[tokio::test]
+    async fn rejoin_queued_during_stop_requests_restart() {
+        let guild_id = GuildId::new(1);
+        let channel_id = ChannelId::new(2);
+        let participant_user_id = UserId::new(3);
+        let handler = discord_capture_handler_for_test(Some(channel_id), None);
+
+        let stopping_reconcile = handler.reconcile_gate.lock().await;
+        let waiting_handler = handler.clone();
+        let rejoin = tokio::spawn(async move {
+            waiting_handler
+                .voice_states
+                .insert((guild_id, participant_user_id), Some(channel_id));
+            let _waiting_reconcile = waiting_handler.reconcile_gate.lock().await;
+            capture_transition(None, waiting_handler.desired_capture_channel(guild_id))
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!rejoin.is_finished());
+        drop(stopping_reconcile);
+        assert_eq!(
+            rejoin.await.expect("rejoin task panicked"),
+            CaptureTransition::Start(channel_id)
+        );
     }
 }
