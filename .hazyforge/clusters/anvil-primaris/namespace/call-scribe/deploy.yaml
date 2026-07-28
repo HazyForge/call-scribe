@@ -1,8 +1,8 @@
 helmChartPath: charts/call-scribe
 
-# Keep the worker stopped until persistent data has been migrated and the local
-# daemon has been stopped. Exactly one Discord worker may use this identity.
-replicaCount: 0
+# Persistent data was migrated before this worker was enabled. Exactly one
+# Discord worker may use this identity.
+replicaCount: 1
 
 image:
   repository: ghcr.io/hazyforge/call-scribe

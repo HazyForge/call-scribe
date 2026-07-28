@@ -22,7 +22,10 @@ Never put the values in Git, Helm values, logs, issue text, or chat. The cluster
 
 ## Bootstrap and cutover
 
-The Anvil overlay intentionally starts with `replicaCount: 0`.
+The initial cutover revision intentionally used `replicaCount: 0`. After the
+retained filesystem and database were verified and the previous worker was
+stopped, the overlay was committed at `replicaCount: 1` with an immutable image
+digest.
 
 1. Publish the immutable amd64 image and pin its digest in `deploy.yaml`.
 2. Let Argo CD create the namespace, ExternalSecrets, CloudNativePG cluster, and retained meetings PVC.
