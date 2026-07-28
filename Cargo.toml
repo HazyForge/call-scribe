@@ -1,0 +1,35 @@
+[package]
+name = "call-scribe"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Consent-first Discord voice recording and transcription for team memory"
+repository = "https://github.com/HazyForge/call-scribe"
+readme = "README.md"
+keywords = ["discord", "transcription", "speech-to-text", "meetings"]
+categories = ["command-line-utilities", "multimedia::audio"]
+
+[features]
+default = []
+discord = ["dep:dashmap", "dep:hound", "dep:rustls", "dep:serenity", "dep:songbird"]
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+dashmap = { version = "6.1", optional = true }
+hound = { version = "3.5", optional = true }
+mime_guess = "2.0"
+reqwest = { version = "0.13", features = ["json", "multipart"] }
+schemars = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "native_tls_backend"], optional = true }
+songbird = { version = "0.6", default-features = false, features = ["driver", "gateway", "native", "serenity", "tungstenite", "receive"], optional = true }
+sqlx = { package = "sqlx-core", version = "0.8", default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "chrono", "json"] }
+sqlx-postgres = { version = "0.8", features = ["chrono", "json"] }
+tokio = { version = "1.47", features = ["fs", "macros", "process", "rt-multi-thread", "signal", "time"] }
+uuid = { version = "1.18", features = ["v4", "serde"] }
+walkdir = "2.5"

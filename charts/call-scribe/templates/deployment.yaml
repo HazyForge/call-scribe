@@ -1,0 +1,99 @@
+{{- if and .Values.image.requireDigest (gt (int .Values.replicaCount) 0) (not .Values.image.digest) }}
+{{- fail "image.digest must be pinned before replicaCount is greater than zero" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "call-scribe.fullname" . }}
+  labels:
+    {{- include "call-scribe.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "call-scribe.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "call-scribe.selectorLabels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: call-scribe
+          image: {{ include "call-scribe.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - discord
+            - --repo
+            - /meetings
+            {{- if .Values.config.skipAnalysis }}
+            - --skip-analysis
+            {{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.providerCredentials.existingSecret | quote }}
+          env:
+            - name: CALL_SCRIBE_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret | quote }}
+                  key: {{ .Values.database.urlKey | quote }}
+            - name: CALL_SCRIBE_CAPTURE_DIR
+              value: {{ .Values.config.captureDir | quote }}
+            - name: CALL_SCRIBE_OUTPUT_DIR
+              value: {{ .Values.config.outputDir | quote }}
+            - name: CALL_SCRIBE_STT_PROVIDER
+              value: {{ .Values.config.sttProvider | quote }}
+            - name: ELEVENLABS_STT_TIMEOUT_SECONDS
+              value: {{ .Values.config.sttTimeoutSeconds | quote }}
+            - name: ELEVENLABS_STT_DIARIZE
+              value: {{ .Values.config.sttDiarize | quote }}
+            - name: ELEVENLABS_STT_TIMESTAMPS_GRANULARITY
+              value: {{ .Values.config.sttTimestampsGranularity | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: meetings
+              mountPath: /meetings
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: meetings
+          persistentVolumeClaim:
+            claimName: {{ include "call-scribe.fullname" . }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

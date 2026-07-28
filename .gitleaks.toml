@@ -1,0 +1,16 @@
+title = "Call Scribe secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Local compiler output is not source"
+paths = [
+  '''(^|/)target/''',
+]
+
+[[allowlists]]
+description = "Exact libcrux dependency-name adjacency false positive"
+regexTarget = "match"
+paths = ['''(^|/)Cargo\.lock$''']
+regexes = ['''libcrux-secrets",\n "libcrux-sha3''']

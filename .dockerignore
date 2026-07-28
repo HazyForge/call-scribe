@@ -1,0 +1,15 @@
+.git
+.env
+.env.*
+!.env.example
+!.env.docker.example
+target
+data
+captures
+meetings/captures
+meetings/*.md
+node_modules
+site/node_modules
+site/dist
+Dockerfile
+compose.yaml

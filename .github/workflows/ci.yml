@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libopus-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: "1.96.0"
+          components: clippy,rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-features --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-features --locked
+
+      - name: Audit dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-audit --locked --version 0.22.2
+          # Each exception has a reachability analysis and review deadline in
+          # docs/security/rustsec-accepted-risk.md. Do not add blanket ignores.
+          cargo audit \
+            --ignore RUSTSEC-2026-0209 \
+            --ignore RUSTSEC-2026-0211 \
+            --ignore RUSTSEC-2026-0124 \
+            --ignore RUSTSEC-2026-0212 \
+            --ignore RUSTSEC-2026-0207 \
+            --ignore RUSTSEC-2026-0208
+
+      - name: Reject common personal-data patterns
+        shell: bash
+        run: |
+          set -euo pipefail
+          home_prefix='/'"home/"
+          users_prefix='/'"Users/"
+          pattern="(${home_prefix}[A-Za-z0-9_.-]+/|${users_prefix}[A-Za-z0-9_.-]+/|[0-9]{17,20}|[A-Za-z0-9._%+-]+@(gmail|outlook|hotmail|live|icloud|yahoo)\\.[A-Za-z]{2,})"
+          if git grep -nEI "${pattern}" -- . ':!Cargo.lock'; then
+            echo 'Potential personal data found in tracked files.' >&2
+            exit 1
+          fi
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Scan for secrets
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install cargo-about
+        run: cargo install --locked cargo-about --version 0.9.1 --features cli
+
+      - name: Validate dependency licenses
+        run: cargo about generate --all-features -o /tmp/third-party-licenses.html about.hbs
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Lint and render chart
+        run: |
+          helm lint charts/call-scribe
+          helm template call-scribe charts/call-scribe \
+            --namespace call-scribe \
+            --values .hazyforge/clusters/anvil-primaris/namespace/call-scribe/deploy.yaml \
+            > /tmp/call-scribe-rendered.yaml
+          grep --quiet '^  replicas: 0$' /tmp/call-scribe-rendered.yaml
+
+      - name: Validate local Compose configuration
+        run: docker compose --env-file .env.docker.example config --quiet

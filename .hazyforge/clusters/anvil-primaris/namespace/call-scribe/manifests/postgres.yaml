@@ -1,0 +1,31 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: call-scribe-postgres
+  namespace: call-scribe
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+spec:
+  instances: 1
+  enableSuperuserAccess: false
+  bootstrap:
+    initdb:
+      database: call_scribe
+      owner: call_scribe
+      secret:
+        name: call-scribe-database
+      dataChecksums: true
+  storage:
+    size: 10Gi
+    storageClass: observability-local
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  affinity:
+    nodeSelector:
+      kubernetes.io/hostname: z400
