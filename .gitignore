@@ -1,0 +1,13 @@
+/target
+/data
+/captures
+/.env
+/.env.*
+!/.env.example
+!/.env.docker.example
+/scripts/run-hazyforge-discord-local.sh
+/meetings/*.md
+/meetings/captures/
+site/*-review.png
+__pycache__/
+*.pyc

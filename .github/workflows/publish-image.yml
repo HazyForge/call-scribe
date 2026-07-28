@@ -1,0 +1,140 @@
+name: Publish image
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    branches:
+      - main
+    types:
+      - completed
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: call-scribe-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/hazyforge/call-scribe
+  SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+            digest_artifact: digests-linux-amd64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=call-scribe-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=call-scribe-${{ matrix.arch }}
+          build-args: SOURCE_REVISION=${{ env.SOURCE_SHA }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Export digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test -n "${DIGEST}"
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.digest_artifact }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish immutable image
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Create manifest list
+        id: manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          short_sha="${SOURCE_SHA:0:7}"
+          source_refs=()
+          for digest_file in /tmp/digests/*; do
+            source_refs+=("${IMAGE_NAME}@sha256:${digest_file##*/}")
+          done
+          test "${#source_refs[@]}" -eq 1
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:main" \
+            --tag "${IMAGE_NAME}:sha-${short_sha}" \
+            "${source_refs[@]}"
+          digest="$(docker buildx imagetools inspect "${IMAGE_NAME}:sha-${short_sha}" --format '{{json .Manifest}}' | jq -r .digest)"
+          test -n "${digest}"
+          echo "ref=${IMAGE_NAME}@${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify published platform
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.manifest.outputs.ref }}
+        run: |
+          set -euo pipefail
+          platforms="$(docker buildx imagetools inspect "${IMAGE_REF}" --format '{{json .Manifest}}' | jq -r '[.manifests[].platform | select(.os == "linux") | "\(.os)/\(.architecture)"] | unique | sort | join(" ")')"
+          test "${platforms}" = "linux/amd64"
+
+      - name: Write summary
+        env:
+          IMAGE_REF: ${{ steps.manifest.outputs.ref }}
+        run: echo "Published immutable image \`${IMAGE_REF}\`" >> "${GITHUB_STEP_SUMMARY}"

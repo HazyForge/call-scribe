@@ -1,0 +1,53 @@
+# Start stopped so operators can provision secrets and persistent state before
+# deliberately enabling the single Discord worker.
+replicaCount: 0
+
+image:
+  repository: ghcr.io/hazyforge/call-scribe
+  tag: main
+  digest: ""
+  requireDigest: false
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+automountServiceAccountToken: false
+
+providerCredentials:
+  existingSecret: call-scribe-provider-credentials
+
+database:
+  existingSecret: call-scribe-database
+  urlKey: uri
+
+config:
+  captureDir: /meetings/captures
+  outputDir: "."
+  sttProvider: eleven-labs
+  sttTimeoutSeconds: 900
+  sttDiarize: true
+  sttTimestampsGranularity: word
+  skipAnalysis: true
+
+persistence:
+  storageClassName: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 50Gi
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+
+# The worker processes one captured session inline. This must remain longer than
+# sttTimeoutSeconds so SIGTERM can be observed after a bounded provider call.
+terminationGracePeriodSeconds: 960
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+networkPolicy:
+  enabled: true

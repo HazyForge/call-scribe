@@ -1,0 +1,46 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: call_scribe
+      POSTGRES_USER: call_scribe
+      POSTGRES_PASSWORD: call_scribe
+    volumes:
+      - call_scribe_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U call_scribe -d call_scribe"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  call-scribe:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: call-scribe:local
+    restart: unless-stopped
+    user: "1000:1000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - path: .env.docker
+        required: false
+    environment:
+      CALL_SCRIBE_CAPTURE_DIR: /meetings/captures
+      CALL_SCRIBE_OUTPUT_DIR: "."
+      CALL_SCRIBE_STT_PROVIDER: eleven-labs
+      CALL_SCRIBE_DATABASE_URL: postgres://call_scribe:call_scribe@postgres:5432/call_scribe
+      ELEVENLABS_STT_TIMEOUT_SECONDS: "900"
+      ELEVENLABS_STT_DIARIZE: "true"
+      ELEVENLABS_STT_TIMESTAMPS_GRANULARITY: word
+    volumes:
+      - ./meetings:/meetings
+    command:
+      - discord
+      - --repo
+      - /meetings
+
+volumes:
+  call_scribe_postgres:
