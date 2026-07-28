@@ -99,7 +99,15 @@ jobs:
             --namespace call-scribe \
             --values .hazyforge/clusters/anvil-primaris/namespace/call-scribe/deploy.yaml \
             > /tmp/call-scribe-rendered.yaml
-          grep --quiet '^  replicas: 0$' /tmp/call-scribe-rendered.yaml
+          grep --quiet '^  replicas: 1$' /tmp/call-scribe-rendered.yaml
+          grep --quiet 'ghcr.io/hazyforge/call-scribe@sha256:' /tmp/call-scribe-rendered.yaml
+          if helm template call-scribe charts/call-scribe \
+            --namespace call-scribe \
+            --values .hazyforge/clusters/anvil-primaris/namespace/call-scribe/deploy.yaml \
+            --set image.digest= >/dev/null 2>&1; then
+            echo 'Anvil deployment rendered without an immutable digest.' >&2
+            exit 1
+          fi
 
       - name: Validate local Compose configuration
         run: docker compose --env-file .env.docker.example config --quiet
