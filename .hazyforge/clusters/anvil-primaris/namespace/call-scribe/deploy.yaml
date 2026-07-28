@@ -6,8 +6,8 @@ replicaCount: 0
 
 image:
   repository: ghcr.io/hazyforge/call-scribe
-  tag: main
-  digest: ""
+  tag: sha-9f316c5
+  digest: sha256:e33f6c5b4efa0e686b0da0c8783cd2bdaf10f7386cb6da9e4b21151d7d07f86a
   requireDigest: true
   pullPolicy: IfNotPresent
 
