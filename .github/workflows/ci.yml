@@ -110,15 +110,19 @@ jobs:
           helm lint charts/call-scribe
           helm template call-scribe charts/call-scribe \
             --namespace call-scribe \
-            --values .hazyforge/clusters/anvil-primaris/namespace/call-scribe/deploy.yaml \
+            --set replicaCount=1 \
+            --set image.repository=example.invalid/call-scribe \
+            --set image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --set image.requireDigest=true \
             > /tmp/call-scribe-rendered.yaml
           grep --quiet '^  replicas: 1$' /tmp/call-scribe-rendered.yaml
-          grep --quiet 'ghcr.io/hazyforge/call-scribe@sha256:' /tmp/call-scribe-rendered.yaml
+          grep --quiet 'example.invalid/call-scribe@sha256:' /tmp/call-scribe-rendered.yaml
           if helm template call-scribe charts/call-scribe \
             --namespace call-scribe \
-            --values .hazyforge/clusters/anvil-primaris/namespace/call-scribe/deploy.yaml \
+            --set replicaCount=1 \
+            --set image.requireDigest=true \
             --set image.digest= >/dev/null 2>&1; then
-            echo 'Anvil deployment rendered without an immutable digest.' >&2
+            echo 'Chart rendered without an immutable digest.' >&2
             exit 1
           fi
 
