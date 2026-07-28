@@ -50,7 +50,7 @@ use sqlx_postgres::{PgPool, PgPoolOptions};
 use tokio::fs;
 use tokio::process::Command;
 #[cfg(feature = "discord")]
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::time::MissedTickBehavior;
 #[cfg(feature = "discord")]
 use uuid::Uuid;
@@ -297,7 +297,7 @@ struct DiscordCaptureHandler {
     config: DiscordCaptureConfig,
     voice_states: Arc<DashMap<(GuildId, UserId), Option<ChannelId>>>,
     active: Arc<Mutex<Option<ActiveCapture>>>,
-    starting: Arc<Mutex<Option<(GuildId, ChannelId)>>>,
+    reconcile_gate: Arc<AsyncMutex<()>>,
     bot_user_id: Arc<Mutex<Option<UserId>>>,
 }
 
@@ -1099,7 +1099,7 @@ impl DiscordCaptureHandler {
             config,
             voice_states: Arc::new(DashMap::new()),
             active: Arc::new(Mutex::new(None)),
-            starting: Arc::new(Mutex::new(None)),
+            reconcile_gate: Arc::new(AsyncMutex::new(())),
             bot_user_id: Arc::new(Mutex::new(None)),
         }
     }
@@ -1113,6 +1113,13 @@ impl DiscordCaptureHandler {
             return;
         }
 
+        // Serenity may deliver voice-state updates while Songbird is joining or
+        // leaving. Serialize those transitions so the next queued update always
+        // evaluates the newest presence map after the prior I/O completes.
+        let _reconcile_guard = self.reconcile_gate.lock().await;
+
+        let desired_channel = self.desired_capture_channel(guild_id);
+
         let active = {
             self.active
                 .lock()
@@ -1123,43 +1130,49 @@ impl DiscordCaptureHandler {
         if let Some(active) = active
             && active.guild_id == guild_id
         {
-            if !self.channel_has_users(guild_id, active.channel_id)
-                && let Err(err) = self.stop_capture(ctx, guild_id).await
-            {
-                eprintln!("failed to stop Discord capture: {err:#}");
-            }
-            return;
-        }
-
-        if let Some(channel_id) = self.start_channel(guild_id) {
-            if !self.mark_starting(guild_id, channel_id) {
+            if desired_channel == Some(active.channel_id) {
                 return;
             }
-
-            let result = self.start_capture(ctx, guild_id, channel_id).await;
-            self.clear_starting(guild_id, channel_id);
-            if let Err(err) = result {
-                eprintln!("failed to start Discord capture: {err:#}");
+            if let Err(err) = self.stop_capture(ctx, guild_id).await {
+                eprintln!("failed to stop Discord capture: {err:#}");
+                return;
             }
+        }
+
+        if let Some(channel_id) = desired_channel
+            && let Err(err) = self.start_capture(ctx, guild_id, channel_id).await
+        {
+            eprintln!("failed to start Discord capture: {err:#}");
         }
     }
 
-    fn start_channel(&self, guild_id: GuildId) -> Option<ChannelId> {
-        if let Some(channel_id) = self.config.allowed_channel_id {
-            if self.channel_has_users(guild_id, channel_id) {
-                return Some(channel_id);
+    fn desired_capture_channel(&self, guild_id: GuildId) -> Option<ChannelId> {
+        match (self.config.allowed_channel_id, self.config.trigger_user_id) {
+            (Some(channel_id), Some(trigger_user_id))
+                if self.user_is_in_channel(guild_id, trigger_user_id, channel_id) =>
+            {
+                Some(channel_id)
             }
-            return None;
-        }
-
-        if let Some(trigger_user_id) = self.config.trigger_user_id {
-            return self
+            (Some(channel_id), None) if self.channel_has_users(guild_id, channel_id) => {
+                Some(channel_id)
+            }
+            (None, Some(trigger_user_id)) => self
                 .voice_states
                 .get(&(guild_id, trigger_user_id))
-                .and_then(|entry| *entry);
+                .and_then(|entry| *entry),
+            _ => None,
         }
+    }
 
-        None
+    fn user_is_in_channel(
+        &self,
+        guild_id: GuildId,
+        user_id: UserId,
+        channel_id: ChannelId,
+    ) -> bool {
+        self.voice_states
+            .get(&(guild_id, user_id))
+            .is_some_and(|entry| *entry == Some(channel_id))
     }
 
     fn channel_has_users(&self, guild_id: GuildId, channel_id: ChannelId) -> bool {
@@ -1173,30 +1186,6 @@ impl DiscordCaptureHandler {
 
     fn bot_user_id(&self) -> Option<UserId> {
         *self.bot_user_id.lock().expect("bot user id mutex poisoned")
-    }
-
-    fn mark_starting(&self, guild_id: GuildId, channel_id: ChannelId) -> bool {
-        let mut starting = self.starting.lock().expect("starting mutex poisoned");
-        if starting
-            .as_ref()
-            .is_some_and(|(starting_guild, _)| *starting_guild == guild_id)
-        {
-            return false;
-        }
-        *starting = Some((guild_id, channel_id));
-        true
-    }
-
-    fn clear_starting(&self, guild_id: GuildId, channel_id: ChannelId) {
-        let mut starting = self.starting.lock().expect("starting mutex poisoned");
-        if starting
-            .as_ref()
-            .is_some_and(|(starting_guild, starting_channel)| {
-                *starting_guild == guild_id && *starting_channel == channel_id
-            })
-        {
-            *starting = None;
-        }
     }
 
     async fn start_capture(
@@ -2631,6 +2620,22 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[cfg(feature = "discord")]
+    fn discord_capture_handler_for_test(
+        allowed_channel_id: Option<ChannelId>,
+        trigger_user_id: Option<UserId>,
+    ) -> DiscordCaptureHandler {
+        let (session_tx, _session_rx) = tokio::sync::mpsc::channel(1);
+        DiscordCaptureHandler::new(DiscordCaptureConfig {
+            capture_dir: PathBuf::from("data/test-captures"),
+            trigger_user_id,
+            guild_id: None,
+            allowed_channel_id,
+            runtime_store: None,
+            session_tx,
+        })
+    }
+
     #[test]
     fn slugifies_titles() {
         assert_eq!(
@@ -2675,5 +2680,59 @@ mod tests {
         });
 
         assert!(diarized_text_from_words(&raw).is_none());
+    }
+
+    #[cfg(feature = "discord")]
+    #[test]
+    fn configured_channel_stops_when_its_last_human_leaves() {
+        let guild_id = GuildId::new(1);
+        let channel_id = ChannelId::new(2);
+        let bot_user_id = UserId::new(3);
+        let participant_user_id = UserId::new(4);
+        let handler = discord_capture_handler_for_test(Some(channel_id), None);
+
+        *handler
+            .bot_user_id
+            .lock()
+            .expect("bot user id mutex poisoned") = Some(bot_user_id);
+        handler
+            .voice_states
+            .insert((guild_id, bot_user_id), Some(channel_id));
+        assert_eq!(handler.desired_capture_channel(guild_id), None);
+
+        handler
+            .voice_states
+            .insert((guild_id, participant_user_id), Some(channel_id));
+        assert_eq!(handler.desired_capture_channel(guild_id), Some(channel_id));
+
+        handler
+            .voice_states
+            .insert((guild_id, participant_user_id), None);
+        assert_eq!(handler.desired_capture_channel(guild_id), None);
+    }
+
+    #[cfg(feature = "discord")]
+    #[test]
+    fn trigger_user_controls_lifecycle_when_channel_is_restricted() {
+        let guild_id = GuildId::new(1);
+        let channel_id = ChannelId::new(2);
+        let trigger_user_id = UserId::new(3);
+        let other_user_id = UserId::new(4);
+        let handler = discord_capture_handler_for_test(Some(channel_id), Some(trigger_user_id));
+
+        handler
+            .voice_states
+            .insert((guild_id, other_user_id), Some(channel_id));
+        assert_eq!(handler.desired_capture_channel(guild_id), None);
+
+        handler
+            .voice_states
+            .insert((guild_id, trigger_user_id), Some(channel_id));
+        assert_eq!(handler.desired_capture_channel(guild_id), Some(channel_id));
+
+        handler
+            .voice_states
+            .insert((guild_id, trigger_user_id), None);
+        assert_eq!(handler.desired_capture_channel(guild_id), None);
     }
 }

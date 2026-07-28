@@ -40,7 +40,7 @@ Never run two workers with the same Discord bot token. Roll back by keeping the 
 
 ## Data handling
 
-The current worker does not implement automatic retention or customer-connected storage. Treat the PVC and database as sensitive. Monitor capacity, restrict access, and define a deletion procedure before using this deployment for broader hosted service.
+The current worker does not implement automatic retention or external-storage export. Treat the PVC and database as sensitive. Monitor capacity, restrict access, and define a deletion procedure for this self-hosted deployment.
 
 Credential rotation is coordinated operations, not an automatic hot reload:
 

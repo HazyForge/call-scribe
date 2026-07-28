@@ -97,6 +97,12 @@ Discord guild voice is feasible with a bot:
 - Start recording when anyone enters the configured guild voice or stage channel.
 - Keep recording while any users remain in that captured channel.
 - Stop recording only when the captured channel becomes empty.
+
+By default, the configured channel uses that occupancy lifecycle. Set
+`CALL_SCRIBE_DISCORD_USER_ID` when one participant should control the capture
+lifecycle instead: the worker starts only while that participant is in the
+configured channel and stops when they leave, while continuing to record every
+speaker who is present during the capture.
 - Receive audio from whoever speaks during that window and feed the WAV into this CLI's core pipeline.
 
 The Rust adapter uses the existing Discord voice stack:

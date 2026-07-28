@@ -83,4 +83,5 @@ The runtime database is metadata-first. Raw audio and rendered transcripts are
 files on operator-managed local or persistent-volume storage; the database
 records their paths and lifecycle metadata. Storage encryption, access control,
 backup, and retention are operator responsibilities. This release does not
-provide automatic retention cleanup or a customer-storage delivery connector.
+provide automatic retention cleanup or external-storage export. Operators own
+retention, backup, and access-control decisions.
