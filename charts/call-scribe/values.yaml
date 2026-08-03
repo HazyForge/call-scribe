@@ -27,6 +27,44 @@ config:
   sttDiarize: true
   sttTimestampsGranularity: word
   skipAnalysis: true
+  # record-only leaves raw audio as a recording entry until Transcribe is invoked.
+  captureMode: record-only
+  organizationId: org_private_alpha
+
+api:
+  enabled: false
+  replicaCount: 1
+  port: 8080
+  meetingsDir: /meetings
+  webDir: /usr/share/call-scribe/web
+  # Private-alpha convenience auth subject. Leave empty for real OIDC only.
+  devAuthSub: ""
+  oidcIssuer: "https://hazyforge1-azsbgb.us1.zitadel.cloud"
+  oidcAudience: ""
+  publicOrigin: "https://callscribe.hazyforge.io"
+  cookieSecure: true
+  # API-only secret with CALL_SCRIBE_OIDC_CLIENT_ID and
+  # CALL_SCRIBE_OIDC_CLIENT_SECRET. Do not project it into the Discord worker.
+  oidcCredentials:
+    existingSecret: ""
+    clientIdKey: CALL_SCRIBE_OIDC_CLIENT_ID
+    clientSecretKey: CALL_SCRIBE_OIDC_CLIENT_SECRET
+  openaiBaseUrl: "https://codex.hazycloud.io/v1"
+  openaiModel: "gpt-5.4"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  httpRoute:
+    enabled: false
+    gatewayName: gateway
+    gatewayNamespace: gateway
+    sectionName: https-callscribe-hazyforge-io
+    hostnames:
+      - callscribe.hazyforge.io
 
 persistence:
   storageClassName: ""

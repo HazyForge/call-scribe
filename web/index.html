@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Call Scribe</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230b1220'/%3E%3Cpath d='M12 36c4-10 8-16 12-16s6 8 10 16 8 16 12 16 8-6 12-16' stroke='%2356f0c8' stroke-width='4' fill='none' stroke-linecap='round'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="mark" aria-hidden="true"></div>
+          <div>
+            <div class="brand-name">Call Scribe</div>
+            <div class="brand-sub">Recording control plane</div>
+          </div>
+        </div>
+        <div class="top-meta">
+          <span id="user-label" class="pill muted">Not signed in</span>
+          <span id="org-label" class="pill">—</span>
+          <button id="btn-sign-out" class="btn ghost compact" type="button" hidden>Sign out</button>
+        </div>
+      </header>
+
+      <section id="auth-panel" class="card auth-card">
+        <h1>Sign in</h1>
+        <p class="lede">
+          Use your Hazy Forge account to access recordings, view transcripts in-app,
+          and download transcript files. Authentication stays in a secure browser session.
+        </p>
+        <div class="row">
+          <a id="btn-sign-in" class="btn primary" href="/auth/login">Sign in with Hazy Forge</a>
+        </div>
+        <p id="auth-error" class="error" hidden></p>
+      </section>
+
+      <main id="app-main" class="layout" hidden>
+        <nav class="tabs" role="tablist">
+          <button class="tab active" data-tab="recordings" type="button">Recordings</button>
+          <button class="tab" data-tab="transcripts" type="button">Transcripts</button>
+          <button class="tab" data-tab="github" type="button">GitHub</button>
+        </nav>
+
+        <section id="panel-recordings" class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Recordings</h2>
+              <p class="lede">Captured Discord audio waiting for or after transcription.</p>
+            </div>
+            <button id="btn-refresh-recordings" class="btn ghost" type="button">Refresh</button>
+          </div>
+          <div id="recordings-empty" class="empty" hidden>No recordings yet.</div>
+          <div id="recordings-list" class="list"></div>
+        </section>
+
+        <section id="panel-transcripts" class="panel" hidden>
+          <div class="panel-head">
+            <div>
+              <h2>Transcripts</h2>
+              <p class="lede">Transcription jobs and completed Markdown artifacts. Create GitHub issues from a completed transcript.</p>
+            </div>
+            <button id="btn-refresh-transcripts" class="btn ghost" type="button">Refresh</button>
+          </div>
+          <div id="transcripts-empty" class="empty" hidden>No transcripts yet.</div>
+          <div id="transcripts-list" class="list"></div>
+        </section>
+
+        <section id="panel-github" class="panel" hidden>
+          <div class="panel-head">
+            <div>
+              <h2>GitHub connection</h2>
+              <p class="lede">
+                Connect GitHub so Call Scribe can open issues from a transcript without downloading it first.
+                Private alpha can use a personal access token with <code>repo</code> scope, or the deployment token.
+              </p>
+            </div>
+            <button id="btn-refresh-github" class="btn ghost" type="button">Refresh</button>
+          </div>
+          <div id="github-status" class="item-meta" style="margin-bottom:1rem"></div>
+          <label class="field">
+            <span>Personal access token (optional if deployment token is configured)</span>
+            <input id="github-token-input" type="password" autocomplete="off" placeholder="ghp_… or github_pat_…" />
+          </label>
+          <label class="field">
+            <span>Default repository (owner/name)</span>
+            <input id="github-repo-input" type="text" autocomplete="off" placeholder="HazyForge/call-scribe" />
+          </label>
+          <div class="row">
+            <button id="btn-github-connect" class="btn primary" type="button">Connect / save</button>
+            <button id="btn-github-use-deploy" class="btn ghost" type="button">Use deployment token</button>
+          </div>
+          <div id="github-repos" class="list" style="margin-top:1rem"></div>
+          <p id="github-error" class="error" hidden></p>
+        </section>
+      </main>
+
+      <div id="toast" class="toast" hidden></div>
+
+      <div id="transcript-modal" class="modal" hidden>
+        <div class="modal-backdrop" data-action="close-modal"></div>
+        <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="transcript-modal-title">
+          <div class="modal-head">
+            <div>
+              <h2 id="transcript-modal-title">Transcript</h2>
+              <p id="transcript-modal-sub" class="lede"></p>
+            </div>
+            <button id="btn-close-modal" class="btn ghost" type="button">Close</button>
+          </div>
+          <pre id="transcript-modal-body" class="transcript-body"></pre>
+        </div>
+      </div>
+    </div>
+    <script src="/assets/app.js" type="module"></script>
+  </body>
+</html>

@@ -1,0 +1,151 @@
+{{- if .Values.api.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "call-scribe.fullname" . }}-api
+  labels:
+    {{- include "call-scribe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.api.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "call-scribe.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        {{- include "call-scribe.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+    spec:
+      automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: call-scribe-api
+          image: {{ include "call-scribe.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - serve
+          ports:
+            - name: http
+              containerPort: {{ .Values.api.port }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.providerCredentials.existingSecret | quote }}
+                optional: true
+          env:
+            - name: CALL_SCRIBE_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret | quote }}
+                  key: {{ .Values.database.urlKey | quote }}
+            - name: CALL_SCRIBE_API_BIND
+              value: {{ printf "0.0.0.0:%v" .Values.api.port | quote }}
+            - name: CALL_SCRIBE_MEETINGS_DIR
+              value: {{ .Values.api.meetingsDir | quote }}
+            - name: CALL_SCRIBE_WEB_DIR
+              value: {{ .Values.api.webDir | quote }}
+            - name: CALL_SCRIBE_STT_PROVIDER
+              value: {{ .Values.config.sttProvider | quote }}
+            - name: CALL_SCRIBE_ORGANIZATION_ID
+              value: {{ .Values.config.organizationId | quote }}
+            - name: CALL_SCRIBE_CAPTURE_MODE
+              value: {{ .Values.config.captureMode | quote }}
+            {{- if .Values.api.devAuthSub }}
+            - name: CALL_SCRIBE_DEV_AUTH_SUB
+              value: {{ .Values.api.devAuthSub | quote }}
+            {{- end }}
+            {{- if .Values.api.oidcIssuer }}
+            - name: CALL_SCRIBE_OIDC_ISSUER
+              value: {{ .Values.api.oidcIssuer | quote }}
+            {{- end }}
+            {{- if .Values.api.oidcAudience }}
+            - name: CALL_SCRIBE_OIDC_AUDIENCE
+              value: {{ .Values.api.oidcAudience | quote }}
+            {{- end }}
+            {{- if .Values.api.oidcCredentials.existingSecret }}
+            - name: CALL_SCRIBE_OIDC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.api.oidcCredentials.existingSecret | quote }}
+                  key: {{ .Values.api.oidcCredentials.clientIdKey | quote }}
+            - name: CALL_SCRIBE_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.api.oidcCredentials.existingSecret | quote }}
+                  key: {{ .Values.api.oidcCredentials.clientSecretKey | quote }}
+            {{- end }}
+            - name: CALL_SCRIBE_PUBLIC_ORIGIN
+              value: {{ .Values.api.publicOrigin | quote }}
+            - name: CALL_SCRIBE_COOKIE_SECURE
+              value: {{ .Values.api.cookieSecure | quote }}
+            {{- if .Values.api.openaiBaseUrl }}
+            - name: OPENAI_BASE_URL
+              value: {{ .Values.api.openaiBaseUrl | quote }}
+            - name: OPENAI_STT_BASE_URL
+              value: {{ .Values.api.openaiBaseUrl | quote }}
+            {{- end }}
+            {{- if .Values.api.openaiModel }}
+            - name: OPENAI_MODEL
+              value: {{ .Values.api.openaiModel | quote }}
+            {{- end }}
+            - name: ELEVENLABS_STT_TIMEOUT_SECONDS
+              value: {{ .Values.config.sttTimeoutSeconds | quote }}
+            - name: ELEVENLABS_STT_DIARIZE
+              value: {{ .Values.config.sttDiarize | quote }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: meetings
+              mountPath: /meetings
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+      volumes:
+        - name: meetings
+          persistentVolumeClaim:
+            claimName: {{ include "call-scribe.fullname" . }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
