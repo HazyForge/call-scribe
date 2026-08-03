@@ -31,6 +31,31 @@ config:
   captureMode: record-only
   organizationId: org_private_alpha
 
+api:
+  enabled: false
+  replicaCount: 1
+  port: 8080
+  meetingsDir: /meetings
+  webDir: /usr/share/call-scribe/web
+  # Private-alpha convenience auth subject. Leave empty for real OIDC only.
+  devAuthSub: ""
+  oidcIssuer: ""
+  oidcAudience: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  httpRoute:
+    enabled: false
+    gatewayName: gateway
+    gatewayNamespace: gateway
+    sectionName: https-callscribe-hazyforge-io
+    hostnames:
+      - callscribe.hazyforge.io
+
 persistence:
   storageClassName: ""
   accessModes:
