@@ -142,8 +142,12 @@ function renderTranscripts(items) {
   for (const item of items) {
     const node = document.createElement("article");
     node.className = "item";
+    const completed = (item.status || "").toLowerCase() === "completed";
     const open = item.delivery_uri
       ? `<a class="btn ghost" href="/v1/orgs/${encodeURIComponent(state.orgId)}/transcripts/${encodeURIComponent(item.id)}/content" target="_blank" rel="noreferrer">Open</a>`
+      : "";
+    const issues = completed
+      ? `<button class="btn primary" type="button" data-action="github-issues" data-id="${escapeHtml(item.id)}">GitHub issues</button>`
       : "";
     node.innerHTML = `
       <div>
@@ -157,9 +161,107 @@ function renderTranscripts(items) {
         ${item.error ? `<div class="error">${escapeHtml(item.error)}</div>` : ""}
         ${item.delivery_uri ? `<div class="item-meta">path: ${escapeHtml(item.delivery_uri)}</div>` : ""}
       </div>
-      <div class="item-actions">${open}</div>
+      <div class="item-actions">${open}${issues}</div>
     `;
     els.transcriptsList.appendChild(node);
+  }
+}
+
+async function loadGitHub() {
+  if (!state.orgId) return;
+  const status = await api(`/v1/orgs/${encodeURIComponent(state.orgId)}/github/status`);
+  const el = document.getElementById("github-status");
+  const err = document.getElementById("github-error");
+  err.hidden = true;
+  el.innerHTML = `
+    ${status.connected ? statusPill("connected") : statusPill("not connected")}
+    <span>${escapeHtml(status.github_login || "no login")}</span>
+    <span>default ${escapeHtml(status.default_repo || "—")}</span>
+    <span>source ${escapeHtml(status.token_source || "—")}</span>
+    <span>deploy token ${status.deployment_token_configured ? "yes" : "no"}</span>
+  `;
+  if (status.default_repo) {
+    document.getElementById("github-repo-input").value = status.default_repo;
+  }
+  const reposEl = document.getElementById("github-repos");
+  reposEl.innerHTML = "";
+  if (status.connected) {
+    try {
+      const { repos } = await api(`/v1/orgs/${encodeURIComponent(state.orgId)}/github/repos`);
+      for (const repo of (repos || []).slice(0, 30)) {
+        const node = document.createElement("button");
+        node.type = "button";
+        node.className = "btn ghost";
+        node.textContent = repo;
+        node.addEventListener("click", () => {
+          document.getElementById("github-repo-input").value = repo;
+        });
+        reposEl.appendChild(node);
+      }
+    } catch (e) {
+      // listing may fail if token lacks scopes; still allow manual repo
+    }
+  }
+}
+
+async function connectGitHub({ useDeploy = false } = {}) {
+  const err = document.getElementById("github-error");
+  err.hidden = true;
+  const access_token = useDeploy
+    ? null
+    : document.getElementById("github-token-input").value.trim() || null;
+  const default_repo = document.getElementById("github-repo-input").value.trim() || null;
+  try {
+    await api(`/v1/orgs/${encodeURIComponent(state.orgId)}/github/connect`, {
+      method: "POST",
+      json: { access_token, default_repo },
+    });
+    document.getElementById("github-token-input").value = "";
+    await loadGitHub();
+    toast(useDeploy ? "Using deployment GitHub token" : "GitHub connected");
+  } catch (e) {
+    err.hidden = false;
+    err.textContent = e.message || String(e);
+  }
+}
+
+async function createIssuesFromTranscript(transcriptId) {
+  const repo =
+    document.getElementById("github-repo-input")?.value?.trim() ||
+    prompt("Repository (owner/name)", "HazyForge/call-scribe");
+  if (!repo) return;
+  toast("Extracting issues from transcript…");
+  try {
+    const preview = await api(
+      `/v1/orgs/${encodeURIComponent(state.orgId)}/transcripts/${encodeURIComponent(transcriptId)}/github/issues`,
+      {
+        method: "POST",
+        json: { repo, dry_run: true },
+      },
+    );
+    const proposed = Array.isArray(preview.proposed) ? preview.proposed : [];
+    const titles = proposed.map((p, i) => `${i + 1}. ${p.title}`).join("\n") || "(none found)";
+    const ok = confirm(
+      `Preview for ${repo} (${proposed.length} issue${proposed.length === 1 ? "" : "s"}):\n\n${titles}\n\nCreate these on GitHub now?`,
+    );
+    if (!ok || proposed.length === 0) {
+      toast(proposed.length ? "Preview only — nothing created" : "No issues proposed");
+      return;
+    }
+    toast("Creating GitHub issues…");
+    const res = await api(
+      `/v1/orgs/${encodeURIComponent(state.orgId)}/transcripts/${encodeURIComponent(transcriptId)}/github/issues`,
+      {
+        method: "POST",
+        json: { repo, dry_run: false },
+      },
+    );
+    const created = Array.isArray(res.created) ? res.created : [];
+    const urls = created.map((c) => `#${c.number} ${c.title}\n${c.url}`).join("\n\n") || "(none)";
+    alert(`Created ${created.length} issue(s):\n\n${urls}`);
+    toast(`Created ${created.length} issue(s)`);
+  } catch (e) {
+    toast(e.message || String(e));
   }
 }
 
@@ -193,7 +295,7 @@ async function signIn() {
   localStorage.setItem(TOKEN_KEY, token);
   try {
     await loadMe();
-    await Promise.all([loadRecordings(), loadTranscripts()]);
+    await Promise.all([loadRecordings(), loadTranscripts(), loadGitHub().catch(() => {})]);
     toast("Signed in");
   } catch (err) {
     localStorage.removeItem(TOKEN_KEY);
@@ -219,6 +321,10 @@ function switchTab(name) {
   });
   document.getElementById("panel-recordings").hidden = name !== "recordings";
   document.getElementById("panel-transcripts").hidden = name !== "transcripts";
+  document.getElementById("panel-github").hidden = name !== "github";
+  if (name === "github") {
+    loadGitHub().catch((e) => toast(e.message));
+  }
 }
 
 els.btnSignIn.addEventListener("click", signIn);
@@ -269,6 +375,30 @@ els.recordingsList.addEventListener("click", async (event) => {
   }
 });
 
+els.transcriptsList.addEventListener("click", async (event) => {
+  const btn = event.target.closest("[data-action='github-issues']");
+  if (!btn) return;
+  btn.disabled = true;
+  try {
+    await createIssuesFromTranscript(btn.dataset.id);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.getElementById("btn-github-connect").addEventListener("click", () => connectGitHub());
+document.getElementById("btn-github-use-deploy").addEventListener("click", () =>
+  connectGitHub({ useDeploy: true }),
+);
+document.getElementById("btn-refresh-github").addEventListener("click", async () => {
+  try {
+    await loadGitHub();
+    toast("GitHub status refreshed");
+  } catch (e) {
+    toast(e.message);
+  }
+});
+
 async function boot() {
   try {
     await fetch("/healthz");
@@ -282,7 +412,7 @@ async function boot() {
   }
   try {
     await loadMe();
-    await Promise.all([loadRecordings(), loadTranscripts()]);
+    await Promise.all([loadRecordings(), loadTranscripts(), loadGitHub().catch(() => {})]);
   } catch (err) {
     if (state.token) {
       clearAuth();

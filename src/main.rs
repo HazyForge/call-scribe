@@ -22,6 +22,7 @@ use clap::{Parser, ValueEnum};
 #[cfg(feature = "discord")]
 use dashmap::DashMap;
 mod api;
+mod github_issues;
 mod providers;
 
 use providers::{
@@ -147,6 +148,10 @@ struct ServeArgs {
     /// Optional OIDC audience / client id check.
     #[arg(long = "oidc-audience", env = "CALL_SCRIBE_OIDC_AUDIENCE")]
     oidc_audience: Option<String>,
+
+    /// Optional GitHub token for creating issues from transcripts.
+    #[arg(long = "github-token", env = "GITHUB_TOKEN")]
+    github_token: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -293,6 +298,7 @@ pub(crate) async fn migrate_runtime_schema(pool: &PgPool) -> Result<()> {
         include_str!("../migrations/20260601183000_runtime_sessions_artifacts_audit.sql"),
         include_str!("../migrations/20260601190000_drop_legacy_runtime_migrations.sql"),
         include_str!("../migrations/20260803120000_multi_tenant_recordings_transcripts.sql"),
+        include_str!("../migrations/20260803140000_github_connections_and_issue_jobs.sql"),
     ] {
         sqlx::raw_sql::raw_sql(migration)
             .execute(pool)
@@ -870,6 +876,7 @@ async fn main() -> Result<()> {
                 args.dev_auth_sub,
                 args.oidc_issuer,
                 args.oidc_audience,
+                args.github_token,
             )
             .await
         }

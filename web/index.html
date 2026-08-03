@@ -44,6 +44,7 @@
         <nav class="tabs" role="tablist">
           <button class="tab active" data-tab="recordings" type="button">Recordings</button>
           <button class="tab" data-tab="transcripts" type="button">Transcripts</button>
+          <button class="tab" data-tab="github" type="button">GitHub</button>
         </nav>
 
         <section id="panel-recordings" class="panel">
@@ -62,12 +63,40 @@
           <div class="panel-head">
             <div>
               <h2>Transcripts</h2>
-              <p class="lede">Transcription jobs and completed Markdown artifacts.</p>
+              <p class="lede">Transcription jobs and completed Markdown artifacts. Create GitHub issues from a completed transcript.</p>
             </div>
             <button id="btn-refresh-transcripts" class="btn ghost" type="button">Refresh</button>
           </div>
           <div id="transcripts-empty" class="empty" hidden>No transcripts yet.</div>
           <div id="transcripts-list" class="list"></div>
+        </section>
+
+        <section id="panel-github" class="panel" hidden>
+          <div class="panel-head">
+            <div>
+              <h2>GitHub connection</h2>
+              <p class="lede">
+                Connect GitHub so Call Scribe can open issues from a transcript without downloading it first.
+                Private alpha can use a personal access token with <code>repo</code> scope, or the deployment token.
+              </p>
+            </div>
+            <button id="btn-refresh-github" class="btn ghost" type="button">Refresh</button>
+          </div>
+          <div id="github-status" class="item-meta" style="margin-bottom:1rem"></div>
+          <label class="field">
+            <span>Personal access token (optional if deployment token is configured)</span>
+            <input id="github-token-input" type="password" autocomplete="off" placeholder="ghp_… or github_pat_…" />
+          </label>
+          <label class="field">
+            <span>Default repository (owner/name)</span>
+            <input id="github-repo-input" type="text" autocomplete="off" placeholder="HazyForge/call-scribe" />
+          </label>
+          <div class="row">
+            <button id="btn-github-connect" class="btn primary" type="button">Connect / save</button>
+            <button id="btn-github-use-deploy" class="btn ghost" type="button">Use deployment token</button>
+          </div>
+          <div id="github-repos" class="list" style="margin-top:1rem"></div>
+          <p id="github-error" class="error" hidden></p>
         </section>
       </main>
 
