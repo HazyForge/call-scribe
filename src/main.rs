@@ -59,6 +59,8 @@ use walkdir::{DirEntry, WalkDir};
 const DEFAULT_OUTPUT_DIR: &str = "docs/meetings";
 #[cfg(feature = "discord")]
 const DEFAULT_CAPTURE_DIR: &str = "data/discord-captures";
+#[cfg(feature = "discord")]
+const DEFAULT_ORGANIZATION_ID: &str = "org_private_alpha";
 const STT_SEGMENT_MAX_INPUT_BYTES: u64 = 100_000_000;
 const LONG_RECORDING_SEGMENT_SECONDS: u32 = 600;
 const TRANSCRIPTION_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
@@ -191,6 +193,26 @@ struct DiscordArgs {
     /// Optional Postgres database URL for runtime sessions, artifacts, and audit events.
     #[arg(long = "database-url", env = "CALL_SCRIBE_DATABASE_URL")]
     database_url: Option<String>,
+
+    /// Capture mode after a Discord session ends.
+    ///
+    /// `record-only` (default) keeps raw audio as a recording entry and waits for an explicit
+    /// transcribe action. `auto-transcribe` runs STT immediately when the call ends.
+    #[arg(
+        long = "capture-mode",
+        env = "CALL_SCRIBE_CAPTURE_MODE",
+        value_enum,
+        default_value_t = CaptureMode::RecordOnly
+    )]
+    capture_mode: CaptureMode,
+
+    /// Organization that owns Discord captures written to the runtime database.
+    #[arg(
+        long = "organization-id",
+        env = "CALL_SCRIBE_ORGANIZATION_ID",
+        default_value = DEFAULT_ORGANIZATION_ID
+    )]
+    organization_id: String,
 }
 
 #[cfg(feature = "discord")]
@@ -216,6 +238,25 @@ impl SttProvider {
         match self {
             Self::ElevenLabs => "ElevenLabs",
             Self::OpenAi => "OpenAI",
+        }
+    }
+}
+
+#[cfg(feature = "discord")]
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum CaptureMode {
+    /// Persist raw audio only; wait for an explicit transcribe action.
+    RecordOnly,
+    /// Transcribe automatically when the Discord session ends.
+    AutoTranscribe,
+}
+
+#[cfg(feature = "discord")]
+impl CaptureMode {
+    fn as_db_value(self) -> &'static str {
+        match self {
+            Self::RecordOnly => "record_only",
+            Self::AutoTranscribe => "auto_transcribe",
         }
     }
 }
@@ -337,6 +378,8 @@ struct CapturedSession {
 #[derive(Clone)]
 struct SqlxRuntimeStore {
     pool: PgPool,
+    organization_id: String,
+    capture_mode: CaptureMode,
 }
 
 #[cfg(feature = "discord")]
@@ -352,15 +395,24 @@ struct RuntimeAuditEvent<'a> {
 
 #[cfg(feature = "discord")]
 impl SqlxRuntimeStore {
-    async fn connect(database_url: &str) -> Result<Self> {
+    async fn connect(
+        database_url: &str,
+        organization_id: String,
+        capture_mode: CaptureMode,
+    ) -> Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .connect(database_url)
             .await
             .context("failed to connect to Call Scribe runtime database")?;
 
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            organization_id,
+            capture_mode,
+        };
         store.migrate().await?;
+        store.ensure_organization().await?;
         Ok(store)
     }
 
@@ -368,12 +420,34 @@ impl SqlxRuntimeStore {
         for migration in [
             include_str!("../migrations/20260601183000_runtime_sessions_artifacts_audit.sql"),
             include_str!("../migrations/20260601190000_drop_legacy_runtime_migrations.sql"),
+            include_str!("../migrations/20260803120000_multi_tenant_recordings_transcripts.sql"),
         ] {
             sqlx::raw_sql::raw_sql(migration)
                 .execute(&self.pool)
                 .await
                 .context("failed to migrate Call Scribe runtime database")?;
         }
+        Ok(())
+    }
+
+    async fn ensure_organization(&self) -> Result<()> {
+        let name = if self.organization_id == DEFAULT_ORGANIZATION_ID {
+            "Hazy Forge Private Alpha"
+        } else {
+            "Call Scribe Organization"
+        };
+        sqlx::query::query(
+            r#"
+INSERT INTO call_scribe_organizations (id, name)
+VALUES ($1, $2)
+ON CONFLICT (id) DO NOTHING
+"#,
+        )
+        .bind(&self.organization_id)
+        .bind(name)
+        .execute(&self.pool)
+        .await
+        .context("failed to ensure Call Scribe organization row")?;
         Ok(())
     }
 
@@ -393,18 +467,22 @@ impl SqlxRuntimeStore {
         sqlx::query::query(
             r#"
 INSERT INTO call_scribe_capture_sessions
-    (id, source, guild_id, channel_id, title, status, started_at, metadata)
+    (id, organization_id, source, guild_id, channel_id, title, status, mode, started_at, metadata)
 VALUES
-    ($1, 'discord', $2, $3, $4, 'recording', $5, $6)
+    ($1, $2, 'discord', $3, $4, $5, 'recording', $6, $7, $8)
 ON CONFLICT (id) DO UPDATE SET
     status = EXCLUDED.status,
+    mode = EXCLUDED.mode,
+    organization_id = EXCLUDED.organization_id,
     updated_at = now()
 "#,
         )
         .bind(session_id)
+        .bind(&self.organization_id)
         .bind(&guild_id)
         .bind(&channel_id)
         .bind(title)
+        .bind(self.capture_mode.as_db_value())
         .bind(started_at)
         .bind(&metadata)
         .execute(&self.pool)
@@ -418,7 +496,10 @@ ON CONFLICT (id) DO UPDATE SET
             actor_id: None,
             guild_id: Some(&guild_id),
             channel_id: Some(&channel_id),
-            metadata: serde_json::json!({ "title": title }),
+            metadata: serde_json::json!({
+                "title": title,
+                "mode": self.capture_mode.as_db_value(),
+            }),
         })
         .await?;
         Ok(())
@@ -451,15 +532,31 @@ WHERE id = $1
             actor_id: None,
             guild_id: None,
             channel_id: None,
-            metadata: serde_json::json!({}),
+            metadata: serde_json::json!({
+                "mode": self.capture_mode.as_db_value(),
+            }),
         })
         .await?;
         Ok(())
     }
 
-    async fn record_processing_started(&self, session_id: &str) -> Result<()> {
-        self.update_status(session_id, "transcribing", None, serde_json::json!({}))
-            .await?;
+    async fn create_transcript_job(&self, session_id: &str, provider: &str) -> Result<String> {
+        let transcript_id = Uuid::new_v4().to_string();
+        sqlx::query::query(
+            r#"
+INSERT INTO call_scribe_transcripts
+    (id, organization_id, session_id, status, provider, started_at, metadata)
+VALUES
+    ($1, $2, $3, 'running', $4, now(), '{}'::jsonb)
+"#,
+        )
+        .bind(&transcript_id)
+        .bind(&self.organization_id)
+        .bind(session_id)
+        .bind(provider)
+        .execute(&self.pool)
+        .await
+        .context("failed to create transcript job")?;
         self.record_audit_event(RuntimeAuditEvent {
             session_id: Some(session_id),
             event_type: "transcription_started",
@@ -467,25 +564,48 @@ WHERE id = $1
             actor_id: None,
             guild_id: None,
             channel_id: None,
-            metadata: serde_json::json!({}),
+            metadata: serde_json::json!({
+                "transcript_id": transcript_id,
+                "provider": provider,
+            }),
         })
-        .await
+        .await?;
+        Ok(transcript_id)
     }
 
-    async fn record_processing_completed(
+    async fn complete_transcript_job(
         &self,
+        transcript_id: &str,
         session_id: &str,
         transcript_path: Option<&Path>,
     ) -> Result<()> {
+        let delivery_uri = transcript_path.map(|path| path.display().to_string());
         let metadata = serde_json::json!({
-            "transcript_path": transcript_path.map(|path| path.display().to_string()),
+            "transcript_path": delivery_uri,
         });
         sqlx::query::query(
             r#"
-UPDATE call_scribe_capture_sessions
+UPDATE call_scribe_transcripts
 SET status = 'completed',
-    completed_at = now(),
+    delivery_uri = $2,
     error = NULL,
+    completed_at = now(),
+    metadata = metadata || $3,
+    updated_at = now()
+WHERE id = $1
+"#,
+        )
+        .bind(transcript_id)
+        .bind(&delivery_uri)
+        .bind(&metadata)
+        .execute(&self.pool)
+        .await
+        .context("failed to complete transcript job")?;
+
+        sqlx::query::query(
+            r#"
+UPDATE call_scribe_capture_sessions
+SET error = NULL,
     metadata = metadata || $2,
     updated_at = now()
 WHERE id = $1
@@ -495,7 +615,8 @@ WHERE id = $1
         .bind(&metadata)
         .execute(&self.pool)
         .await
-        .context("failed to record runtime session completion")?;
+        .context("failed to update recording metadata after transcription")?;
+
         self.record_audit_event(RuntimeAuditEvent {
             session_id: Some(session_id),
             event_type: "transcription_completed",
@@ -503,51 +624,70 @@ WHERE id = $1
             actor_id: None,
             guild_id: None,
             channel_id: None,
-            metadata,
+            metadata: serde_json::json!({
+                "transcript_id": transcript_id,
+                "transcript_path": delivery_uri,
+            }),
         })
         .await
     }
 
-    async fn record_processing_failed(
+    async fn fail_transcript_job(
         &self,
+        transcript_id: Option<&str>,
         session_id: &str,
         error: &anyhow::Error,
     ) -> Result<()> {
         let error = format!("{error:#}");
-        self.update_status(
-            session_id,
-            "failed",
-            Some(&error),
-            serde_json::json!({ "error": error }),
-        )
-        .await
-    }
+        if let Some(transcript_id) = transcript_id {
+            sqlx::query::query(
+                r#"
+UPDATE call_scribe_transcripts
+SET status = 'failed',
+    error = $2,
+    completed_at = now(),
+    metadata = metadata || $3,
+    updated_at = now()
+WHERE id = $1
+"#,
+            )
+            .bind(transcript_id)
+            .bind(&error)
+            .bind(serde_json::json!({ "error": error }))
+            .execute(&self.pool)
+            .await
+            .context("failed to mark transcript job failed")?;
+        }
 
-    async fn update_status(
-        &self,
-        session_id: &str,
-        status: &str,
-        error: Option<&str>,
-        metadata: Value,
-    ) -> Result<()> {
         sqlx::query::query(
             r#"
 UPDATE call_scribe_capture_sessions
-SET status = $2,
-    error = $3,
-    metadata = metadata || $4,
+SET error = $2,
+    metadata = metadata || $3,
     updated_at = now()
 WHERE id = $1
 "#,
         )
         .bind(session_id)
-        .bind(status)
-        .bind(error)
-        .bind(&metadata)
+        .bind(&error)
+        .bind(serde_json::json!({ "last_transcription_error": error }))
         .execute(&self.pool)
         .await
-        .with_context(|| format!("failed to update runtime session status to {status}"))?;
-        Ok(())
+        .context("failed to record transcription failure on session")?;
+
+        self.record_audit_event(RuntimeAuditEvent {
+            session_id: Some(session_id),
+            event_type: "transcription_failed",
+            actor_kind: "system",
+            actor_id: None,
+            guild_id: None,
+            channel_id: None,
+            metadata: serde_json::json!({
+                "transcript_id": transcript_id,
+                "error": error,
+            }),
+        })
+        .await
     }
 
     async fn record_artifact(
@@ -563,12 +703,13 @@ WHERE id = $1
         sqlx::query::query(
             r#"
 INSERT INTO call_scribe_artifacts
-    (id, session_id, kind, path, byte_size, metadata)
+    (id, organization_id, session_id, kind, path, byte_size, metadata)
 VALUES
-    ($1, $2, $3, $4, $5, $6)
+    ($1, $2, $3, $4, $5, $6, $7)
 "#,
         )
         .bind(&artifact_id)
+        .bind(&self.organization_id)
         .bind(session_id)
         .bind(kind)
         .bind(&path_text)
@@ -600,12 +741,13 @@ VALUES
         sqlx::query::query(
             r#"
 INSERT INTO call_scribe_audit_events
-    (id, session_id, event_type, actor_kind, actor_id, guild_id, channel_id, metadata)
+    (id, organization_id, session_id, event_type, actor_kind, actor_id, guild_id, channel_id, metadata)
 VALUES
-    ($1, $2, $3, $4, $5, $6, $7, $8)
+    ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 "#,
         )
         .bind(&id)
+        .bind(&self.organization_id)
         .bind(event.session_id)
         .bind(event.event_type)
         .bind(event.actor_kind)
@@ -676,7 +818,12 @@ async fn main() -> Result<()> {
 
 #[cfg(feature = "discord")]
 async fn migrate_runtime_db(args: RuntimeDbArgs) -> Result<()> {
-    SqlxRuntimeStore::connect(&args.database_url).await?;
+    SqlxRuntimeStore::connect(
+        &args.database_url,
+        DEFAULT_ORGANIZATION_ID.to_string(),
+        CaptureMode::RecordOnly,
+    )
+    .await?;
     println!("Call Scribe runtime database is ready.");
     Ok(())
 }
@@ -814,8 +961,17 @@ async fn run_discord(args: DiscordArgs) -> Result<()> {
 
     let runtime_store = match args.database_url.as_deref() {
         Some(database_url) => {
-            let store = SqlxRuntimeStore::connect(database_url).await?;
-            println!("Connected Call Scribe runtime database.");
+            let store = SqlxRuntimeStore::connect(
+                database_url,
+                args.organization_id.clone(),
+                args.capture_mode,
+            )
+            .await?;
+            println!(
+                "Connected Call Scribe runtime database (org={}, mode={}).",
+                args.organization_id,
+                args.capture_mode.as_db_value()
+            );
             Some(store)
         }
         None => None,
@@ -879,6 +1035,7 @@ async fn run_discord(args: DiscordArgs) -> Result<()> {
                     &args.output_dir,
                     args.skip_analysis,
                     args.apply_docs,
+                    args.capture_mode,
                     runtime_store.as_ref(),
                 ).await {
                     eprintln!("post-capture processing failed; raw audio was retained: {err:#}");
@@ -931,10 +1088,47 @@ async fn handle_captured_session(
     output_dir: &Path,
     skip_analysis: bool,
     apply_docs: bool,
+    capture_mode: CaptureMode,
     runtime_store: Option<&SqlxRuntimeStore>,
 ) -> Result<()> {
+    let primary_wav_path = session
+        .wav_paths
+        .first()
+        .context("captured Discord session did not include any audio files")?;
+    println!(
+        "Captured Discord session {} from guild {} channel {} stopped at {} (mode={}).",
+        session.id,
+        session.guild_id.get(),
+        session.channel_id.get(),
+        session.stopped_at.format("%Y-%m-%d %H:%M:%S %Z"),
+        capture_mode.as_db_value()
+    );
+    if session.wav_paths.len() == 1 {
+        println!("Captured Discord audio: {}", primary_wav_path.display());
+    } else {
+        println!("Captured Discord audio segments:");
+        for wav_path in &session.wav_paths {
+            println!("  {}", wav_path.display());
+        }
+    }
+
+    if capture_mode == CaptureMode::RecordOnly {
+        println!(
+            "Record-only mode: left session {} as a recording entry. Use the API Transcribe action to create a transcript.",
+            session.id
+        );
+        return Ok(());
+    }
+
+    let mut transcript_id: Option<String> = None;
     if let Some(store) = runtime_store {
-        store.record_processing_started(&session.id).await?;
+        match store
+            .create_transcript_job(&session.id, provider.label())
+            .await
+        {
+            Ok(id) => transcript_id = Some(id),
+            Err(err) => eprintln!("failed to create transcript job: {err:#}"),
+        }
     }
 
     let result = handle_captured_session_inner(
@@ -945,12 +1139,15 @@ async fn handle_captured_session(
         skip_analysis,
         apply_docs,
         runtime_store,
+        transcript_id.as_deref(),
     )
     .await;
 
     if let Err(err) = &result
         && let Some(store) = runtime_store
-        && let Err(store_err) = store.record_processing_failed(&session.id, err).await
+        && let Err(store_err) = store
+            .fail_transcript_job(transcript_id.as_deref(), &session.id, err)
+            .await
     {
         eprintln!("failed to record runtime processing failure: {store_err:#}");
     }
@@ -967,6 +1164,7 @@ async fn handle_captured_session_inner(
     skip_analysis: bool,
     apply_docs: bool,
     runtime_store: Option<&SqlxRuntimeStore>,
+    transcript_id: Option<&str>,
 ) -> Result<()> {
     let title = format!(
         "Discord architecture call {}",
@@ -976,21 +1174,6 @@ async fn handle_captured_session_inner(
         .wav_paths
         .first()
         .context("captured Discord session did not include any audio files")?;
-    println!(
-        "Processing Discord session {} from guild {} channel {} stopped at {}.",
-        session.id,
-        session.guild_id.get(),
-        session.channel_id.get(),
-        session.stopped_at.format("%Y-%m-%d %H:%M:%S %Z")
-    );
-    if session.wav_paths.len() == 1 {
-        println!("Captured Discord audio: {}", primary_wav_path.display());
-    } else {
-        println!("Captured Discord audio segments:");
-        for wav_path in &session.wav_paths {
-            println!("  {}", wav_path.display());
-        }
-    }
 
     if let Some(repo) = repo
         && apply_docs
@@ -1025,9 +1208,11 @@ async fn handle_captured_session_inner(
                     }),
                 )
                 .await?;
-            store
-                .record_processing_completed(&session.id, Some(&paths.transcript))
-                .await?;
+            if let Some(transcript_id) = transcript_id {
+                store
+                    .complete_transcript_job(transcript_id, &session.id, Some(&paths.transcript))
+                    .await?;
+            }
         }
     } else {
         let rendered_transcript = transcribe_captured_audio(provider, &session.wav_paths).await?;
@@ -1056,9 +1241,11 @@ async fn handle_captured_session_inner(
                     }),
                 )
                 .await?;
-            store
-                .record_processing_completed(&session.id, Some(&transcript_path))
-                .await?;
+            if let Some(transcript_id) = transcript_id {
+                store
+                    .complete_transcript_job(transcript_id, &session.id, Some(&transcript_path))
+                    .await?;
+            }
         }
     }
 
