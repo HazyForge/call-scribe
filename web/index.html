@@ -26,8 +26,8 @@
       <section id="auth-panel" class="card auth-card">
         <h1>Sign in</h1>
         <p class="lede">
-          Private alpha uses a ZITADEL subject (or local dev subject) to load org
-          memberships. Paste your bearer token, or use the configured dev subject.
+          Sign in with a bearer token to load org data. Private alpha dev subject
+          is <code>palehazy</code>. Transcripts open in-app over authenticated API calls only.
         </p>
         <label class="field">
           <span>Bearer token / dev subject</span>
@@ -101,6 +101,20 @@
       </main>
 
       <div id="toast" class="toast" hidden></div>
+
+      <div id="transcript-modal" class="modal" hidden>
+        <div class="modal-backdrop" data-action="close-modal"></div>
+        <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="transcript-modal-title">
+          <div class="modal-head">
+            <div>
+              <h2 id="transcript-modal-title">Transcript</h2>
+              <p id="transcript-modal-sub" class="lede"></p>
+            </div>
+            <button id="btn-close-modal" class="btn ghost" type="button">Close</button>
+          </div>
+          <pre id="transcript-modal-body" class="transcript-body"></pre>
+        </div>
+      </div>
     </div>
     <script src="/assets/app.js" type="module"></script>
   </body>
