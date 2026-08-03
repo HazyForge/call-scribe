@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -15,6 +15,7 @@ use serde_json::Value;
 use sqlx::row::Row as _;
 use sqlx_postgres::{PgPool, PgPoolOptions};
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
 use crate::{
@@ -136,6 +137,7 @@ pub async fn run_serve(
     database_url: &str,
     bind: &str,
     meetings_dir: PathBuf,
+    web_dir: PathBuf,
     stt_provider: SttProvider,
     organization_id: String,
     dev_auth_sub: Option<String>,
@@ -165,6 +167,10 @@ pub async fn run_serve(
         );
     }
 
+    if !web_dir.exists() {
+        bail_web_dir(&web_dir)?;
+    }
+
     let state = Arc::new(ApiState {
         pool,
         dev_auth_sub,
@@ -174,7 +180,11 @@ pub async fn run_serve(
         meetings_dir,
     });
 
-    let app = Router::new()
+    let index = web_dir.join("index.html");
+    let assets = ServeDir::new(web_dir.join("assets"));
+    let spa = ServeFile::new(index);
+
+    let api = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/me", get(me))
         .route(
@@ -197,22 +207,41 @@ pub async fn run_serve(
             "/v1/orgs/{org_id}/transcripts/{transcript_id}",
             get(get_transcript),
         )
+        .route(
+            "/v1/orgs/{org_id}/transcripts/{transcript_id}/content",
+            get(get_transcript_content),
+        )
+        .with_state(state);
+
+    let app = Router::new()
+        .merge(api)
+        .nest_service("/assets", assets)
+        .fallback_service(spa)
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any),
-        )
-        .with_state(state);
+        );
 
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("failed to bind API on {bind}"))?;
-    println!("Call Scribe API listening on http://{bind}");
+    println!(
+        "Call Scribe API + UI listening on http://{bind} (web_dir={})",
+        web_dir.display()
+    );
     axum::serve(listener, app)
         .await
         .context("API server failed")?;
     Ok(())
+}
+
+fn bail_web_dir(web_dir: &Path) -> Result<()> {
+    anyhow::bail!(
+        "web UI directory not found at {} — set CALL_SCRIBE_WEB_DIR or package web/ into the image",
+        web_dir.display()
+    )
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -398,6 +427,48 @@ WHERE organization_id = $1 AND id = $2
         created_at: row.try_get("created_at").map_err(ApiError::internal)?,
         completed_at: row.try_get("completed_at").map_err(ApiError::internal)?,
     }))
+}
+
+async fn get_transcript_content(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    AxumPath((org_id, transcript_id)): AxumPath<(String, String)>,
+) -> Result<Response, ApiError> {
+    let user = authenticate(&state, &headers).await?;
+    require_org(&user, &org_id)?;
+    let row = sqlx::query::query(
+        r#"
+SELECT delivery_uri
+FROM call_scribe_transcripts
+WHERE organization_id = $1 AND id = $2 AND status = 'completed'
+"#,
+    )
+    .bind(&org_id)
+    .bind(&transcript_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::not_found("completed transcript not found"))?;
+
+    let delivery_uri: Option<String> = row.try_get("delivery_uri").map_err(ApiError::internal)?;
+    let path = delivery_uri
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| ApiError::not_found("transcript has no delivery path"))?;
+    let path = PathBuf::from(path);
+    if !path.is_file() {
+        return Err(ApiError::not_found(format!(
+            "transcript file missing: {}",
+            path.display()
+        )));
+    }
+    let body = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok((
+        [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        body,
+    )
+        .into_response())
 }
 
 async fn transcribe_recording(

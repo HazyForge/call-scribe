@@ -33,7 +33,7 @@ songbird = { version = "0.6", default-features = false, features = ["driver", "g
 sqlx = { package = "sqlx-core", version = "0.8", default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "chrono", "json"] }
 sqlx-postgres = { version = "0.8", features = ["chrono", "json"] }
 tokio = { version = "1.47", features = ["fs", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 tracing = "0.1"
 uuid = { version = "1.18", features = ["v4", "serde"] }
 walkdir = "2.5"
