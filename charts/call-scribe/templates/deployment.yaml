@@ -59,6 +59,10 @@ spec:
               value: {{ .Values.config.outputDir | quote }}
             - name: CALL_SCRIBE_STT_PROVIDER
               value: {{ .Values.config.sttProvider | quote }}
+            - name: CALL_SCRIBE_CAPTURE_MODE
+              value: {{ .Values.config.captureMode | quote }}
+            - name: CALL_SCRIBE_ORGANIZATION_ID
+              value: {{ .Values.config.organizationId | quote }}
             - name: ELEVENLABS_STT_TIMEOUT_SECONDS
               value: {{ .Values.config.sttTimeoutSeconds | quote }}
             - name: ELEVENLABS_STT_DIARIZE

@@ -27,6 +27,9 @@ config:
   sttDiarize: true
   sttTimestampsGranularity: word
   skipAnalysis: true
+  # record-only leaves raw audio as a recording entry until Transcribe is invoked.
+  captureMode: record-only
+  organizationId: org_private_alpha
 
 persistence:
   storageClassName: ""

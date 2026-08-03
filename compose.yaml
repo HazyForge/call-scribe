@@ -32,6 +32,8 @@ services:
       CALL_SCRIBE_OUTPUT_DIR: "."
       CALL_SCRIBE_STT_PROVIDER: eleven-labs
       CALL_SCRIBE_DATABASE_URL: postgres://call_scribe:call_scribe@postgres:5432/call_scribe
+      CALL_SCRIBE_ORGANIZATION_ID: org_private_alpha
+      CALL_SCRIBE_CAPTURE_MODE: record-only
       ELEVENLABS_STT_TIMEOUT_SECONDS: "900"
       ELEVENLABS_STT_DIARIZE: "true"
       ELEVENLABS_STT_TIMESTAMPS_GRANULARITY: word
