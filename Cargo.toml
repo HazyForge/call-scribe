@@ -22,7 +22,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 dashmap = { version = "6.1", optional = true }
 hound = { version = "3.5", optional = true }
-jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"] }
 mime_guess = "2.0"
 rand = { version = "0.9", features = ["std", "std_rng"] }
 reqwest = { version = "0.13", features = ["form", "json", "multipart"] }
