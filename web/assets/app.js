@@ -406,21 +406,20 @@ async function boot() {
     /* ignore */
   }
 
-  // Prefer saved token; otherwise try private-alpha server-side dev auth (no bearer).
-  if (state.token) {
-    els.tokenInput.value = state.token;
+  // Require an explicit bearer token. Private alpha: use subject "palehazy"
+  // when CALL_SCRIBE_DEV_AUTH_SUB is configured on the server.
+  if (!state.token) {
+    setSignedIn(false);
+    return;
   }
+  els.tokenInput.value = state.token;
   try {
     await loadMe();
     await Promise.all([loadRecordings(), loadTranscripts(), loadGitHub().catch(() => {})]);
   } catch (err) {
-    if (state.token) {
-      clearAuth();
-      els.authError.hidden = false;
-      els.authError.textContent = err.message || String(err);
-    } else {
-      setSignedIn(false);
-    }
+    clearAuth();
+    els.authError.hidden = false;
+    els.authError.textContent = err.message || String(err);
   }
 }
 

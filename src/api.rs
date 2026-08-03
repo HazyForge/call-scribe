@@ -718,21 +718,22 @@ WHERE id = $1
 }
 
 async fn authenticate(state: &ApiState, headers: &HeaderMap) -> Result<AuthUser, ApiError> {
+    // Never auto-authenticate anonymous requests. Private-alpha DEV auth still
+    // requires an explicit Bearer token (value may equal CALL_SCRIBE_DEV_AUTH_SUB).
     if let Some(auth) = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
     {
         if let Some(token) = auth.strip_prefix("Bearer ") {
-            return resolve_bearer(state, token).await;
+            let token = token.trim();
+            if !token.is_empty() {
+                return resolve_bearer(state, token).await;
+            }
         }
     }
 
-    if let Some(sub) = &state.dev_auth_sub {
-        return load_user_by_sub(state, sub, None).await;
-    }
-
     Err(ApiError::unauthorized(
-        "missing Authorization Bearer token (or set CALL_SCRIBE_DEV_AUTH_SUB for local alpha)",
+        "missing Authorization Bearer token",
     ))
 }
 
