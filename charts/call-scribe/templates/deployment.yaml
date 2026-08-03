@@ -7,6 +7,7 @@ metadata:
   name: {{ include "call-scribe.fullname" . }}
   labels:
     {{- include "call-scribe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
 spec:
   replicas: {{ .Values.replicaCount }}
   strategy:
@@ -14,10 +15,12 @@ spec:
   selector:
     matchLabels:
       {{- include "call-scribe.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
   template:
     metadata:
       labels:
         {{- include "call-scribe.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
     spec:
       automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
@@ -59,6 +62,10 @@ spec:
               value: {{ .Values.config.outputDir | quote }}
             - name: CALL_SCRIBE_STT_PROVIDER
               value: {{ .Values.config.sttProvider | quote }}
+            - name: CALL_SCRIBE_CAPTURE_MODE
+              value: {{ .Values.config.captureMode | quote }}
+            - name: CALL_SCRIBE_ORGANIZATION_ID
+              value: {{ .Values.config.organizationId | quote }}
             - name: ELEVENLABS_STT_TIMEOUT_SECONDS
               value: {{ .Values.config.sttTimeoutSeconds | quote }}
             - name: ELEVENLABS_STT_DIARIZE
