@@ -21,6 +21,7 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
 #[cfg(feature = "discord")]
 use dashmap::DashMap;
+mod api;
 mod providers;
 
 use providers::{
@@ -45,7 +46,6 @@ use songbird::driver::{DecodeConfig, DecodeMode};
 use songbird::model::payload::{ClientDisconnect, Speaking};
 #[cfg(feature = "discord")]
 use songbird::{Config as SongbirdConfig, CoreEvent, EventContext, SerenityInit, Songbird};
-#[cfg(feature = "discord")]
 use sqlx_postgres::{PgPool, PgPoolOptions};
 use tokio::fs;
 use tokio::process::Command;
@@ -93,15 +93,56 @@ struct Cli {
 enum Commands {
     /// Transcribe an audio/video recording and apply the result to a repo as docs and tasks.
     Ingest(IngestArgs),
-    /// Watch Discord voice state, capture a configured call, and transcribe it.
+    /// Watch Discord voice state, capture a configured call, and optionally transcribe it.
     #[cfg(feature = "discord")]
     Discord(DiscordArgs),
     /// Create or update the Postgres runtime schema.
     #[cfg(feature = "discord")]
     RuntimeDb(RuntimeDbArgs),
+    /// Serve the authenticated control-plane API (recordings + transcripts).
+    Serve(ServeArgs),
     /// Explain how to enable Discord capture in this build.
     #[cfg(not(feature = "discord"))]
     Discord(DiscordDisabledArgs),
+}
+
+#[derive(Debug, Parser)]
+struct ServeArgs {
+    /// Postgres database URL for runtime sessions, artifacts, and audit events.
+    #[arg(long = "database-url", env = "CALL_SCRIBE_DATABASE_URL")]
+    database_url: String,
+
+    /// Listen address for the HTTP API.
+    #[arg(long, env = "CALL_SCRIBE_API_BIND", default_value = "0.0.0.0:8080")]
+    bind: String,
+
+    /// Directory that holds meeting Markdown and related artifacts.
+    #[arg(long, env = "CALL_SCRIBE_MEETINGS_DIR", default_value = "meetings")]
+    meetings_dir: PathBuf,
+
+    /// STT provider used by the Transcribe action.
+    #[arg(long, env = "CALL_SCRIBE_STT_PROVIDER", value_enum, default_value_t = SttProvider::ElevenLabs)]
+    provider: SttProvider,
+
+    /// Default organization for private-alpha membership bootstrap.
+    #[arg(
+        long = "organization-id",
+        env = "CALL_SCRIBE_ORGANIZATION_ID",
+        default_value = "org_private_alpha"
+    )]
+    organization_id: String,
+
+    /// Local private-alpha auth subject when OIDC is not wired yet.
+    #[arg(long = "dev-auth-sub", env = "CALL_SCRIBE_DEV_AUTH_SUB")]
+    dev_auth_sub: Option<String>,
+
+    /// Optional OIDC issuer URL (ZITADEL).
+    #[arg(long = "oidc-issuer", env = "CALL_SCRIBE_OIDC_ISSUER")]
+    oidc_issuer: Option<String>,
+
+    /// Optional OIDC audience / client id check.
+    #[arg(long = "oidc-audience", env = "CALL_SCRIBE_OIDC_AUDIENCE")]
+    oidc_audience: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -228,18 +269,33 @@ struct RuntimeDbArgs {
 struct DiscordDisabledArgs {}
 
 #[derive(Clone, Debug, ValueEnum)]
-enum SttProvider {
+pub(crate) enum SttProvider {
     ElevenLabs,
     OpenAi,
 }
 
 impl SttProvider {
-    fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::ElevenLabs => "ElevenLabs",
             Self::OpenAi => "OpenAI",
         }
     }
+}
+
+/// Apply embedded runtime SQL migrations (idempotent DDL).
+pub(crate) async fn migrate_runtime_schema(pool: &PgPool) -> Result<()> {
+    for migration in [
+        include_str!("../migrations/20260601183000_runtime_sessions_artifacts_audit.sql"),
+        include_str!("../migrations/20260601190000_drop_legacy_runtime_migrations.sql"),
+        include_str!("../migrations/20260803120000_multi_tenant_recordings_transcripts.sql"),
+    ] {
+        sqlx::raw_sql::raw_sql(migration)
+            .execute(pool)
+            .await
+            .context("failed to migrate Call Scribe runtime database")?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "discord")]
@@ -316,7 +372,7 @@ struct OutputPaths {
 }
 
 #[derive(Clone, Debug)]
-struct RenderedTranscript {
+pub(crate) struct RenderedTranscript {
     text: String,
     diarized: bool,
 }
@@ -417,17 +473,7 @@ impl SqlxRuntimeStore {
     }
 
     async fn migrate(&self) -> Result<()> {
-        for migration in [
-            include_str!("../migrations/20260601183000_runtime_sessions_artifacts_audit.sql"),
-            include_str!("../migrations/20260601190000_drop_legacy_runtime_migrations.sql"),
-            include_str!("../migrations/20260803120000_multi_tenant_recordings_transcripts.sql"),
-        ] {
-            sqlx::raw_sql::raw_sql(migration)
-                .execute(&self.pool)
-                .await
-                .context("failed to migrate Call Scribe runtime database")?;
-        }
-        Ok(())
+        migrate_runtime_schema(&self.pool).await
     }
 
     async fn ensure_organization(&self) -> Result<()> {
@@ -809,6 +855,19 @@ async fn main() -> Result<()> {
         Commands::Discord(args) => run_discord(args).await,
         #[cfg(feature = "discord")]
         Commands::RuntimeDb(args) => migrate_runtime_db(args).await,
+        Commands::Serve(args) => {
+            api::run_serve(
+                &args.database_url,
+                &args.bind,
+                args.meetings_dir,
+                args.provider,
+                args.organization_id,
+                args.dev_auth_sub,
+                args.oidc_issuer,
+                args.oidc_audience,
+            )
+            .await
+        }
         #[cfg(not(feature = "discord"))]
         Commands::Discord(_) => Err(anyhow::anyhow!(
             "Discord capture was not compiled into this binary. Rebuild with `cargo run --features discord -- discord ...` after installing Opus/CMake dependencies."
@@ -1252,8 +1311,7 @@ async fn handle_captured_session_inner(
     Ok(())
 }
 
-#[cfg(feature = "discord")]
-async fn transcribe_captured_audio(
+pub(crate) async fn transcribe_captured_audio(
     provider: &SttProvider,
     wav_paths: &[PathBuf],
 ) -> Result<RenderedTranscript> {
@@ -2592,7 +2650,7 @@ async fn file_size_i64(path: &Path) -> Result<Option<i64>> {
     }
 }
 
-async fn write_standalone_markdown(
+pub(crate) async fn write_standalone_markdown(
     output_dir: &Path,
     title: &str,
     source_audio: Option<&Path>,
