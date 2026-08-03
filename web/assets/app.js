@@ -1,13 +1,10 @@
-const TOKEN_KEY = "call_scribe_bearer";
 const ORG_KEY = "call_scribe_org";
 
 const els = {
   authPanel: document.getElementById("auth-panel"),
   appMain: document.getElementById("app-main"),
-  tokenInput: document.getElementById("token-input"),
   authError: document.getElementById("auth-error"),
-  btnSignIn: document.getElementById("btn-sign-in"),
-  btnClearAuth: document.getElementById("btn-clear-auth"),
+  btnSignOut: document.getElementById("btn-sign-out"),
   userLabel: document.getElementById("user-label"),
   orgLabel: document.getElementById("org-label"),
   recordingsList: document.getElementById("recordings-list"),
@@ -18,7 +15,6 @@ const els = {
 };
 
 let state = {
-  token: localStorage.getItem(TOKEN_KEY) || "",
   orgId: localStorage.getItem(ORG_KEY) || "",
   me: null,
 };
@@ -60,12 +56,12 @@ function formatWhen(value) {
 
 async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
-  if (state.token) headers.set("Authorization", `Bearer ${state.token}`);
   if (options.json) {
     headers.set("Content-Type", "application/json");
   }
   const res = await fetch(path, {
     ...options,
+    credentials: "include",
     headers,
     body: options.json ? JSON.stringify(options.json) : options.body,
   });
@@ -91,7 +87,9 @@ async function api(path, options = {}) {
   }
   if (!res.ok) {
     const msg = data?.error || res.statusText || `HTTP ${res.status}`;
-    throw new Error(msg);
+    const error = new Error(msg);
+    error.status = res.status;
+    throw error;
   }
   return data;
 }
@@ -114,7 +112,7 @@ function closeTranscriptModal() {
 }
 
 async function viewTranscript(transcriptId) {
-  if (!state.token) {
+  if (!state.me || !state.orgId) {
     toast("Sign in to view transcripts");
     return;
   }
@@ -144,10 +142,12 @@ function renderMe() {
     els.userLabel.textContent = "Not signed in";
     els.userLabel.className = "pill muted";
     els.orgLabel.textContent = "—";
+    els.btnSignOut.hidden = true;
     return;
   }
   els.userLabel.textContent = state.me.email || state.me.sub;
   els.userLabel.className = "pill ok";
+  els.btnSignOut.hidden = false;
   const org = state.me.organizations?.find((o) => o.id === state.orgId)
     || state.me.organizations?.[0];
   if (org) {
@@ -155,6 +155,8 @@ function renderMe() {
     localStorage.setItem(ORG_KEY, org.id);
     els.orgLabel.textContent = `${org.name} · ${org.role}`;
   } else {
+    state.orgId = "";
+    localStorage.removeItem(ORG_KEY);
     els.orgLabel.textContent = "No org";
   }
 }
@@ -194,9 +196,13 @@ function renderTranscripts(items) {
     const node = document.createElement("article");
     node.className = "item";
     const completed = (item.status || "").toLowerCase() === "completed";
-    const canView = completed && !!item.delivery_uri;
+    const canView = completed && !!item.content_available;
+    const contentUrl = `/v1/orgs/${encodeURIComponent(state.orgId)}/transcripts/${encodeURIComponent(item.id)}/content`;
     const open = canView
       ? `<button class="btn ghost" type="button" data-action="view-transcript" data-id="${escapeHtml(item.id)}">View</button>`
+      : "";
+    const download = canView
+      ? `<a class="btn ghost" href="${escapeHtml(contentUrl)}?download=1">Download</a>`
       : "";
     const issues = completed
       ? `<button class="btn primary" type="button" data-action="github-issues" data-id="${escapeHtml(item.id)}">GitHub issues</button>`
@@ -212,7 +218,7 @@ function renderTranscripts(items) {
         </div>
         ${item.error ? `<div class="error">${escapeHtml(item.error)}</div>` : ""}
       </div>
-      <div class="item-actions">${open}${issues}</div>
+      <div class="item-actions">${open}${download}${issues}</div>
     `;
     els.transcriptsList.appendChild(node);
   }
@@ -334,36 +340,29 @@ async function loadTranscripts() {
   renderTranscripts(items || []);
 }
 
-async function signIn() {
-  els.authError.hidden = true;
-  const token = els.tokenInput.value.trim();
-  if (!token) {
-    els.authError.hidden = false;
-    els.authError.textContent = "Enter a bearer token or dev subject.";
-    return;
-  }
-  state.token = token;
-  localStorage.setItem(TOKEN_KEY, token);
-  try {
-    await loadMe();
-    await Promise.all([loadRecordings(), loadTranscripts(), loadGitHub().catch(() => {})]);
-    toast("Signed in");
-  } catch (err) {
-    localStorage.removeItem(TOKEN_KEY);
-    state.token = "";
-    setSignedIn(false);
-    els.authError.hidden = false;
-    els.authError.textContent = err.message || String(err);
-  }
-}
-
-function clearAuth() {
-  state.token = "";
+function clearClientSession() {
   state.me = null;
-  localStorage.removeItem(TOKEN_KEY);
-  els.tokenInput.value = "";
+  state.orgId = "";
+  localStorage.removeItem(ORG_KEY);
   setSignedIn(false);
   renderMe();
+}
+
+async function signOut() {
+  clearClientSession();
+  try {
+    const response = await fetch("/auth/logout", {
+      method: "POST",
+      credentials: "include",
+    });
+    if (!response.ok) {
+      throw new Error("The browser cookie was cleared, but the server could not revoke the session.");
+    }
+    window.location.assign("/");
+  } catch (error) {
+    els.authError.hidden = false;
+    els.authError.textContent = error.message || String(error);
+  }
 }
 
 function switchTab(name) {
@@ -378,11 +377,7 @@ function switchTab(name) {
   }
 }
 
-els.btnSignIn.addEventListener("click", signIn);
-els.btnClearAuth.addEventListener("click", clearAuth);
-els.tokenInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") signIn();
-});
+els.btnSignOut.addEventListener("click", signOut);
 
 document.querySelectorAll(".tab").forEach((tab) => {
   tab.addEventListener("click", () => switchTab(tab.dataset.tab));
@@ -470,25 +465,14 @@ document.getElementById("btn-refresh-github").addEventListener("click", async ()
 
 async function boot() {
   try {
-    await fetch("/healthz");
-  } catch {
-    /* ignore */
-  }
-
-  // Require an explicit bearer token. Private alpha: use subject "palehazy"
-  // when CALL_SCRIBE_DEV_AUTH_SUB is configured on the server.
-  if (!state.token) {
-    setSignedIn(false);
-    return;
-  }
-  els.tokenInput.value = state.token;
-  try {
     await loadMe();
     await Promise.all([loadRecordings(), loadTranscripts(), loadGitHub().catch(() => {})]);
   } catch (err) {
-    clearAuth();
-    els.authError.hidden = false;
-    els.authError.textContent = err.message || String(err);
+    clearClientSession();
+    if (err.status !== 401) {
+      els.authError.hidden = false;
+      els.authError.textContent = err.message || String(err);
+    }
   }
 }
 

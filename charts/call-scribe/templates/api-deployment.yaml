@@ -74,6 +74,22 @@ spec:
             - name: CALL_SCRIBE_OIDC_AUDIENCE
               value: {{ .Values.api.oidcAudience | quote }}
             {{- end }}
+            {{- if .Values.api.oidcCredentials.existingSecret }}
+            - name: CALL_SCRIBE_OIDC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.api.oidcCredentials.existingSecret | quote }}
+                  key: {{ .Values.api.oidcCredentials.clientIdKey | quote }}
+            - name: CALL_SCRIBE_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.api.oidcCredentials.existingSecret | quote }}
+                  key: {{ .Values.api.oidcCredentials.clientSecretKey | quote }}
+            {{- end }}
+            - name: CALL_SCRIBE_PUBLIC_ORIGIN
+              value: {{ .Values.api.publicOrigin | quote }}
+            - name: CALL_SCRIBE_COOKIE_SECURE
+              value: {{ .Values.api.cookieSecure | quote }}
             {{- if .Values.api.openaiBaseUrl }}
             - name: OPENAI_BASE_URL
               value: {{ .Values.api.openaiBaseUrl | quote }}

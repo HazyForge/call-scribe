@@ -84,6 +84,9 @@ input:focus {
 
 .row { display: flex; gap: 0.75rem; flex-wrap: wrap; }
 .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 1px solid var(--line);
   background: rgba(255,255,255,0.03);
   color: var(--text);
@@ -91,6 +94,7 @@ input:focus {
   padding: 0.65rem 1rem;
   font: inherit;
   font-weight: 600;
+  text-decoration: none;
   cursor: pointer;
 }
 .btn:hover { border-color: rgba(255,255,255,0.25); }
@@ -101,6 +105,7 @@ input:focus {
   border-color: transparent;
 }
 .btn.ghost { background: transparent; }
+.btn.compact { padding: 0.3rem 0.7rem; font-size: 0.8rem; }
 .btn.danger {
   border-color: rgba(255, 123, 138, 0.35);
   color: #ffd0d6;

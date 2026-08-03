@@ -35,6 +35,20 @@ Product tenants. Private alpha seeds `org_private_alpha`.
 
 OIDC subjects (`oidc_sub`) granted access to an organization. Used by the API/SPA.
 
+### `call_scribe_oauth_states`
+
+Short-lived, one-time authorization-code + PKCE state. The database stores a
+SHA-256/base64url hash of the browser state value together with the PKCE code
+verifier, sanitized return path, and expiry. Expired rows are removed before a
+new login flow starts and after successful callbacks.
+
+### `call_scribe_browser_sessions`
+
+Server-managed human browser sessions. The browser receives the opaque
+`call_scribe_session` cookie while Postgres stores only its
+SHA-256/base64url hash, OIDC subject, optional email, timestamps, and expiry.
+OIDC access, ID, and refresh tokens are not persisted in this table.
+
 ### `call_scribe_discord_guild_links`
 
 Maps Discord guild installs to organizations for multi-tenant capture routing.

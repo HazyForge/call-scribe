@@ -39,8 +39,16 @@ api:
   webDir: /usr/share/call-scribe/web
   # Private-alpha convenience auth subject. Leave empty for real OIDC only.
   devAuthSub: ""
-  oidcIssuer: ""
+  oidcIssuer: "https://hazyforge1-azsbgb.us1.zitadel.cloud"
   oidcAudience: ""
+  publicOrigin: "https://callscribe.hazyforge.io"
+  cookieSecure: true
+  # API-only secret with CALL_SCRIBE_OIDC_CLIENT_ID and
+  # CALL_SCRIBE_OIDC_CLIENT_SECRET. Do not project it into the Discord worker.
+  oidcCredentials:
+    existingSecret: ""
+    clientIdKey: CALL_SCRIBE_OIDC_CLIENT_ID
+    clientSecretKey: CALL_SCRIBE_OIDC_CLIENT_SECRET
   openaiBaseUrl: "https://codex.hazycloud.io/v1"
   openaiModel: "gpt-5.4"
   resources:
