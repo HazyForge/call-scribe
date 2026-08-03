@@ -18,6 +18,9 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
+use crate::github_issues::{
+    create_github_issues, github_user, propose_issues_from_transcript,
+};
 use crate::{
     SttProvider, migrate_runtime_schema, transcribe_captured_audio, write_standalone_markdown,
 };
@@ -35,6 +38,8 @@ pub struct ApiState {
     oidc_audience: Option<String>,
     stt_provider: SttProvider,
     meetings_dir: PathBuf,
+    /// Deployment-level GitHub token (PAT/app) used when org has no user token.
+    github_token: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +148,7 @@ pub async fn run_serve(
     dev_auth_sub: Option<String>,
     oidc_issuer: Option<String>,
     oidc_audience: Option<String>,
+    github_token: Option<String>,
 ) -> Result<()> {
     let pool = PgPoolOptions::new()
         .max_connections(10)
@@ -171,6 +177,14 @@ pub async fn run_serve(
         bail_web_dir(&web_dir)?;
     }
 
+    if github_token.is_some() {
+        println!("GitHub issue creation: deployment GITHUB_TOKEN is configured.");
+    } else {
+        println!(
+            "GitHub issue creation: no GITHUB_TOKEN; orgs can still connect a user PAT in the UI."
+        );
+    }
+
     let state = Arc::new(ApiState {
         pool,
         dev_auth_sub,
@@ -178,6 +192,7 @@ pub async fn run_serve(
         oidc_audience,
         stt_provider,
         meetings_dir,
+        github_token,
     });
 
     let index = web_dir.join("index.html");
@@ -210,6 +225,22 @@ pub async fn run_serve(
         .route(
             "/v1/orgs/{org_id}/transcripts/{transcript_id}/content",
             get(get_transcript_content),
+        )
+        .route(
+            "/v1/orgs/{org_id}/github/status",
+            get(github_status),
+        )
+        .route(
+            "/v1/orgs/{org_id}/github/connect",
+            post(github_connect),
+        )
+        .route(
+            "/v1/orgs/{org_id}/github/repos",
+            get(github_repos),
+        )
+        .route(
+            "/v1/orgs/{org_id}/transcripts/{transcript_id}/github/issues",
+            post(create_issues_from_transcript),
         )
         .with_state(state);
 
@@ -808,6 +839,342 @@ fn require_org(user: &AuthUser, org_id: &str) -> Result<(), ApiError> {
     } else {
         Err(ApiError::forbidden("not a member of this organization"))
     }
+}
+
+#[derive(Debug, Serialize)]
+struct GitHubStatusResponse {
+    connected: bool,
+    github_login: Option<String>,
+    default_repo: Option<String>,
+    token_source: Option<String>,
+    deployment_token_configured: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubConnectRequest {
+    /// Optional personal access token. When omitted, uses deployment GITHUB_TOKEN.
+    access_token: Option<String>,
+    default_repo: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GitHubReposResponse {
+    repos: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateIssuesRequest {
+    /// owner/name
+    repo: String,
+    /// When true, only propose issues without creating them.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateIssuesResponse {
+    job_id: String,
+    dry_run: bool,
+    proposed: Value,
+    created: Value,
+    status: String,
+}
+
+async fn github_status(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    AxumPath(org_id): AxumPath<String>,
+) -> Result<Json<GitHubStatusResponse>, ApiError> {
+    let user = authenticate(&state, &headers).await?;
+    require_org(&user, &org_id)?;
+    let row = sqlx::query::query(
+        r#"
+SELECT github_login, default_repo, token_source, access_token
+FROM call_scribe_github_connections
+WHERE organization_id = $1
+"#,
+    )
+    .bind(&org_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let deployment = state.github_token.is_some();
+    if let Some(row) = row {
+        let user_token: Option<String> = row.try_get("access_token").map_err(ApiError::internal)?;
+        let connected = user_token.as_ref().map(|t| !t.is_empty()).unwrap_or(false) || deployment;
+        Ok(Json(GitHubStatusResponse {
+            connected,
+            github_login: row.try_get("github_login").map_err(ApiError::internal)?,
+            default_repo: row.try_get("default_repo").map_err(ApiError::internal)?,
+            token_source: row.try_get("token_source").map_err(ApiError::internal)?,
+            deployment_token_configured: deployment,
+        }))
+    } else {
+        Ok(Json(GitHubStatusResponse {
+            connected: deployment,
+            github_login: None,
+            default_repo: None,
+            token_source: if deployment {
+                Some("deployment".to_string())
+            } else {
+                None
+            },
+            deployment_token_configured: deployment,
+        }))
+    }
+}
+
+async fn github_connect(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    AxumPath(org_id): AxumPath<String>,
+    Json(body): Json<GitHubConnectRequest>,
+) -> Result<Json<GitHubStatusResponse>, ApiError> {
+    let user = authenticate(&state, &headers).await?;
+    require_org(&user, &org_id)?;
+
+    let token = body
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .or_else(|| state.github_token.clone())
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "provide access_token or configure deployment GITHUB_TOKEN",
+            )
+        })?;
+
+    let (login, _repos) = github_user(&token)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("GitHub token invalid: {e:#}")))?;
+
+    let token_source = if body.access_token.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false)
+    {
+        "user"
+    } else {
+        "deployment"
+    };
+
+    let store_token = if token_source == "user" {
+        body.access_token.clone()
+    } else {
+        None
+    };
+
+    let id = Uuid::new_v4().to_string();
+    sqlx::query::query(
+        r#"
+INSERT INTO call_scribe_github_connections
+    (id, organization_id, github_login, default_repo, access_token, token_source, updated_at)
+VALUES
+    ($1, $2, $3, $4, $5, $6, now())
+ON CONFLICT (organization_id) DO UPDATE SET
+    github_login = EXCLUDED.github_login,
+    default_repo = COALESCE(EXCLUDED.default_repo, call_scribe_github_connections.default_repo),
+    access_token = COALESCE(EXCLUDED.access_token, call_scribe_github_connections.access_token),
+    token_source = EXCLUDED.token_source,
+    updated_at = now()
+"#,
+    )
+    .bind(&id)
+    .bind(&org_id)
+    .bind(&login)
+    .bind(&body.default_repo)
+    .bind(&store_token)
+    .bind(token_source)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    github_status(State(state), headers, AxumPath(org_id)).await
+}
+
+async fn github_repos(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    AxumPath(org_id): AxumPath<String>,
+) -> Result<Json<GitHubReposResponse>, ApiError> {
+    let user = authenticate(&state, &headers).await?;
+    require_org(&user, &org_id)?;
+    let token = resolve_github_token(&state, &org_id)
+        .await?
+        .ok_or_else(|| ApiError::bad_request("GitHub is not connected for this org"))?;
+    let (_login, repos) = github_user(&token)
+        .await
+        .map_err(|e| ApiError::internal(format!("list repos failed: {e:#}")))?;
+    Ok(Json(GitHubReposResponse { repos }))
+}
+
+async fn create_issues_from_transcript(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    AxumPath((org_id, transcript_id)): AxumPath<(String, String)>,
+    Json(body): Json<CreateIssuesRequest>,
+) -> Result<Json<CreateIssuesResponse>, ApiError> {
+    let user = authenticate(&state, &headers).await?;
+    require_org(&user, &org_id)?;
+
+    let token = resolve_github_token(&state, &org_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "GitHub is not connected. Connect a token in Settings or set GITHUB_TOKEN.",
+            )
+        })?;
+
+    let repo = body.repo.trim().to_string();
+    if !repo.contains('/') {
+        return Err(ApiError::bad_request("repo must be owner/name"));
+    }
+
+    let row = sqlx::query::query(
+        r#"
+SELECT delivery_uri, status
+FROM call_scribe_transcripts
+WHERE organization_id = $1 AND id = $2
+"#,
+    )
+    .bind(&org_id)
+    .bind(&transcript_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::not_found("transcript not found"))?;
+
+    let status: String = row.try_get("status").map_err(ApiError::internal)?;
+    if status != "completed" {
+        return Err(ApiError::bad_request(
+            "transcript must be completed before creating GitHub issues",
+        ));
+    }
+    let delivery_uri: Option<String> = row.try_get("delivery_uri").map_err(ApiError::internal)?;
+    let path = delivery_uri
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| ApiError::not_found("transcript has no delivery path"))?;
+    let transcript = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| ApiError::internal(format!("read transcript failed: {e}")))?;
+
+    let job_id = Uuid::new_v4().to_string();
+    sqlx::query::query(
+        r#"
+INSERT INTO call_scribe_github_issue_jobs
+    (id, organization_id, transcript_id, repo, status, dry_run, created_by_sub)
+VALUES
+    ($1, $2, $3, $4, 'running', $5, $6)
+"#,
+    )
+    .bind(&job_id)
+    .bind(&org_id)
+    .bind(&transcript_id)
+    .bind(&repo)
+    .bind(body.dry_run)
+    .bind(&user.sub)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let proposed = propose_issues_from_transcript(&transcript, &repo)
+        .await
+        .map_err(|e| ApiError::internal(format!("issue extraction failed: {e:#}")))?;
+    let proposed_json = serde_json::to_value(&proposed.issues).map_err(ApiError::internal)?;
+
+    let (created_json, status) = if body.dry_run {
+        (serde_json::json!([]), "preview".to_string())
+    } else {
+        match create_github_issues(&token, &repo, &proposed.issues).await {
+            Ok(created) => {
+                let v = serde_json::to_value(&created).map_err(ApiError::internal)?;
+                (v, "completed".to_string())
+            }
+            Err(err) => {
+                let error = format!("{err:#}");
+                sqlx::query::query(
+                    r#"
+UPDATE call_scribe_github_issue_jobs
+SET status = 'failed', error = $2, proposed_json = $3, completed_at = now(), updated_at = now()
+WHERE id = $1
+"#,
+                )
+                .bind(&job_id)
+                .bind(&error)
+                .bind(&proposed_json)
+                .execute(&state.pool)
+                .await
+                .map_err(ApiError::internal)?;
+                return Err(ApiError::internal(error));
+            }
+        }
+    };
+
+    sqlx::query::query(
+        r#"
+UPDATE call_scribe_github_issue_jobs
+SET status = $2,
+    proposed_json = $3,
+    created_json = $4,
+    completed_at = now(),
+    updated_at = now()
+WHERE id = $1
+"#,
+    )
+    .bind(&job_id)
+    .bind(&status)
+    .bind(&proposed_json)
+    .bind(&created_json)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    // Remember default repo for the org.
+    let _ = sqlx::query::query(
+        r#"
+INSERT INTO call_scribe_github_connections
+    (id, organization_id, default_repo, token_source, updated_at)
+VALUES
+    ($1, $2, $3, 'deployment', now())
+ON CONFLICT (organization_id) DO UPDATE SET
+    default_repo = EXCLUDED.default_repo,
+    updated_at = now()
+"#,
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&org_id)
+    .bind(&repo)
+    .execute(&state.pool)
+    .await;
+
+    Ok(Json(CreateIssuesResponse {
+        job_id,
+        dry_run: body.dry_run,
+        proposed: proposed_json,
+        created: created_json,
+        status,
+    }))
+}
+
+async fn resolve_github_token(state: &ApiState, org_id: &str) -> Result<Option<String>, ApiError> {
+    let row = sqlx::query::query(
+        r#"
+SELECT access_token
+FROM call_scribe_github_connections
+WHERE organization_id = $1
+"#,
+    )
+    .bind(org_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if let Some(row) = row {
+        let token: Option<String> = row.try_get("access_token").map_err(ApiError::internal)?;
+        if let Some(token) = token.filter(|t| !t.is_empty()) {
+            return Ok(Some(token));
+        }
+    }
+    Ok(state.github_token.clone())
 }
 
 async fn ensure_organization(pool: &PgPool, organization_id: &str) -> Result<()> {
