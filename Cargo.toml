@@ -17,23 +17,27 @@ discord = ["dep:dashmap", "dep:hound", "dep:rustls", "dep:serenity", "dep:songbi
 anyhow = "1.0"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 dashmap = { version = "6.1", optional = true }
 hound = { version = "3.5", optional = true }
 jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
 mime_guess = "2.0"
-reqwest = { version = "0.13", features = ["json", "multipart"] }
+rand = { version = "0.9", features = ["std", "std_rng"] }
+reqwest = { version = "0.13", features = ["form", "json", "multipart"] }
 schemars = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "native_tls_backend"], optional = true }
 songbird = { version = "0.6", default-features = false, features = ["driver", "gateway", "native", "serenity", "tungstenite", "receive"], optional = true }
 sqlx = { package = "sqlx-core", version = "0.8", default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "chrono", "json"] }
 sqlx-postgres = { version = "0.8", features = ["chrono", "json"] }
 tokio = { version = "1.47", features = ["fs", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"
+urlencoding = "2"
 uuid = { version = "1.18", features = ["v4", "serde"] }
 walkdir = "2.5"

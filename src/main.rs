@@ -23,6 +23,7 @@ use clap::{Parser, ValueEnum};
 use dashmap::DashMap;
 mod api;
 mod github_issues;
+mod oidc_session;
 mod providers;
 
 use providers::{
@@ -47,7 +48,9 @@ use songbird::driver::{DecodeConfig, DecodeMode};
 use songbird::model::payload::{ClientDisconnect, Speaking};
 #[cfg(feature = "discord")]
 use songbird::{Config as SongbirdConfig, CoreEvent, EventContext, SerenityInit, Songbird};
-use sqlx_postgres::{PgPool, PgPoolOptions};
+use sqlx_postgres::PgPool;
+#[cfg(feature = "discord")]
+use sqlx_postgres::PgPoolOptions;
 use tokio::fs;
 use tokio::process::Command;
 #[cfg(feature = "discord")]
@@ -141,9 +144,13 @@ struct ServeArgs {
     #[arg(long = "dev-auth-sub", env = "CALL_SCRIBE_DEV_AUTH_SUB")]
     dev_auth_sub: Option<String>,
 
-    /// Optional OIDC issuer URL (ZITADEL).
-    #[arg(long = "oidc-issuer", env = "CALL_SCRIBE_OIDC_ISSUER")]
-    oidc_issuer: Option<String>,
+    /// OIDC issuer URL (ZITADEL).
+    #[arg(
+        long = "oidc-issuer",
+        env = "CALL_SCRIBE_OIDC_ISSUER",
+        default_value = "https://hazyforge1-azsbgb.us1.zitadel.cloud"
+    )]
+    oidc_issuer: String,
 
     /// Optional OIDC audience / client id check.
     #[arg(long = "oidc-audience", env = "CALL_SCRIBE_OIDC_AUDIENCE")]
@@ -152,6 +159,26 @@ struct ServeArgs {
     /// Optional GitHub token for creating issues from transcripts.
     #[arg(long = "github-token", env = "GITHUB_TOKEN")]
     github_token: Option<String>,
+
+    /// OIDC client id (ZITADEL application) for browser human sign-in.
+    #[arg(long = "oidc-client-id", env = "CALL_SCRIBE_OIDC_CLIENT_ID")]
+    oidc_client_id: Option<String>,
+
+    /// OIDC client secret for the confidential WEB+BASIC application.
+    #[arg(long = "oidc-client-secret", env = "CALL_SCRIBE_OIDC_CLIENT_SECRET")]
+    oidc_client_secret: Option<String>,
+
+    /// Public HTTPS origin used for OIDC redirect_uri.
+    #[arg(
+        long = "public-origin",
+        env = "CALL_SCRIBE_PUBLIC_ORIGIN",
+        default_value = "https://callscribe.hazyforge.io"
+    )]
+    public_origin: String,
+
+    /// Set Secure on the session cookie (default true when public origin is https).
+    #[arg(long = "cookie-secure", env = "CALL_SCRIBE_COOKIE_SECURE")]
+    cookie_secure: Option<bool>,
 }
 
 #[derive(Debug, Parser)]
@@ -299,6 +326,7 @@ pub(crate) async fn migrate_runtime_schema(pool: &PgPool) -> Result<()> {
         include_str!("../migrations/20260601190000_drop_legacy_runtime_migrations.sql"),
         include_str!("../migrations/20260803120000_multi_tenant_recordings_transcripts.sql"),
         include_str!("../migrations/20260803140000_github_connections_and_issue_jobs.sql"),
+        include_str!("../migrations/20260803160000_browser_sessions.sql"),
     ] {
         sqlx::raw_sql::raw_sql(migration)
             .execute(pool)
@@ -866,18 +894,22 @@ async fn main() -> Result<()> {
         #[cfg(feature = "discord")]
         Commands::RuntimeDb(args) => migrate_runtime_db(args).await,
         Commands::Serve(args) => {
-            api::run_serve(
-                &args.database_url,
-                &args.bind,
-                args.meetings_dir,
-                args.web_dir,
-                args.provider,
-                args.organization_id,
-                args.dev_auth_sub,
-                args.oidc_issuer,
-                args.oidc_audience,
-                args.github_token,
-            )
+            api::run_serve(api::ServeConfig {
+                database_url: args.database_url,
+                bind: args.bind,
+                meetings_dir: args.meetings_dir,
+                web_dir: args.web_dir,
+                stt_provider: args.provider,
+                organization_id: args.organization_id,
+                dev_auth_sub: args.dev_auth_sub,
+                oidc_issuer: args.oidc_issuer,
+                oidc_audience: args.oidc_audience,
+                oidc_client_id: args.oidc_client_id,
+                oidc_client_secret: args.oidc_client_secret,
+                public_origin: args.public_origin,
+                cookie_secure: args.cookie_secure,
+                github_token: args.github_token,
+            })
             .await
         }
         #[cfg(not(feature = "discord"))]
