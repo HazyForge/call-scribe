@@ -24,7 +24,7 @@ dashmap = { version = "6.1", optional = true }
 hound = { version = "3.5", optional = true }
 jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
 mime_guess = "2.0"
-rand = { version = "0.9", features = ["std", "std_rng"] }
+rand = { version = "0.10", features = ["std", "std_rng"] }
 reqwest = { version = "0.13", features = ["form", "json", "multipart"] }
 schemars = "1.0"
 serde = { version = "1.0", features = ["derive"] }
