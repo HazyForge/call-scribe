@@ -8,6 +8,5 @@
 /scripts/run-hazyforge-discord-local.sh
 /meetings/*.md
 /meetings/captures/
-site/*-review.png
 __pycache__/
 *.pyc
