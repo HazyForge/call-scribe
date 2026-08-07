@@ -31,7 +31,10 @@ pub struct CreatedIssue {
     pub title: String,
 }
 
-pub async fn propose_issues_from_transcript(transcript: &str, repo: &str) -> Result<ProposedGitHubIssues> {
+pub async fn propose_issues_from_transcript(
+    transcript: &str,
+    repo: &str,
+) -> Result<ProposedGitHubIssues> {
     let clipped = clip_transcript(transcript);
     let config = OpenAiConfig::from_env().await?;
     let provider = OpenAiProvider::new(config);
@@ -108,10 +111,7 @@ pub async fn create_github_issues(
         let value: serde_json::Value =
             serde_json::from_str(&text).context("failed to parse GitHub issue response")?;
         created.push(CreatedIssue {
-            number: value
-                .get("number")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
+            number: value.get("number").and_then(|v| v.as_u64()).unwrap_or(0),
             url: value
                 .get("html_url")
                 .and_then(|v| v.as_str())
@@ -155,10 +155,7 @@ pub async fn github_user(token: &str) -> Result<(String, Vec<String>)> {
         .context("failed to list GitHub repos")?;
     let mut repo_names = Vec::new();
     if repos_response.status().is_success() {
-        let repos: Vec<serde_json::Value> = repos_response
-            .json()
-            .await
-            .unwrap_or_default();
+        let repos: Vec<serde_json::Value> = repos_response.json().await.unwrap_or_default();
         for repo in repos {
             if let Some(full) = repo.get("full_name").and_then(|v| v.as_str()) {
                 repo_names.push(full.to_string());
