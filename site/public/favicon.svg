@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Call Scribe">
+  <!-- Deep violet-ink tile + amber waveform mark (reads at 16px) -->
+  <rect width="32" height="32" rx="8" fill="#0d0a16"/>
+  <rect x="1" y="1" width="30" height="30" rx="7" fill="none" stroke="#ffb454" stroke-opacity="0.22" stroke-width="1"/>
+  <!-- Sound waveform turning into a page (voice -> memory) -->
+  <path fill="#ffb454" d="M6 15h2.2v2H6z"/>
+  <path fill="#ffb454" d="M10.4 11.5h2.2v9h-2.2z"/>
+  <path fill="#ffb454" d="M14.8 8.5h2.2v15h-2.2z"/>
+  <!-- Page condensing from the wave -->
+  <rect x="21.2" y="8.5" width="4.8" height="6.2" rx="1" fill="#ff7a3d"/>
+  <rect x="22.6" y="10" width="2" height="0.8" rx="0.4" fill="#fff1e0"/>
+  <rect x="22.6" y="11.6" width="2" height="0.8" rx="0.4" fill="#fff1e0" opacity="0.75"/>
+  <!-- Spark -->
+  <circle cx="27.4" cy="7" r="1.3" fill="#fff1e0"/>
+  <circle cx="27.4" cy="7" r="2.5" fill="none" stroke="#ffb454" stroke-opacity="0.55" stroke-width="0.9"/>
+</svg>

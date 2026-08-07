@@ -1,70 +1,43 @@
 <!doctype html>
 <html lang="en">
   <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Call Scribe | Discord calls, written down</title>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="Run a self-hosted Discord voice worker and write transcripts to operator-managed storage."
+      content="Call Scribe — record architecture calls and turn them into durable, repo-local Markdown memory. Diarized transcripts, action items, and a Codex-ready handoff."
     />
-    <meta property="og:title" content="Call Scribe" />
-    <meta property="og:description" content="Discord calls, written down." />
+    <meta name="theme-color" content="#0d0a16" />
     <meta property="og:type" content="website" />
-    <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="styles.css" />
+    <meta property="og:site_name" content="Call Scribe" />
+    <meta property="og:title" content="Call Scribe · Hazy Forge" />
+    <meta
+      property="og:description"
+      content="Meetings become memory. Record architecture calls and get diarized Markdown transcripts, decisions, and a Codex-ready handoff in your repo."
+    />
+    <meta property="og:url" content="https://call-scribe.hazyforge.io/" />
+    <meta property="og:image" content="https://call-scribe.hazyforge.io/og.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Call Scribe · Hazy Forge" />
+    <meta
+      name="twitter:description"
+      content="Meetings become memory. Record architecture calls and get diarized Markdown transcripts, decisions, and a Codex-ready handoff in your repo."
+    />
+    <meta name="twitter:image" content="https://call-scribe.hazyforge.io/og.jpg" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Barlow:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <title>Call Scribe · Hazy Forge</title>
   </head>
   <body>
-    <header class="topbar">
-      <a class="brand" href="#top" aria-label="Call Scribe home">
-        <span class="brand-mark">CS</span>
-        <span>Call Scribe</span>
-      </a>
-      <a class="top-link" href="https://github.com/HazyForge/call-scribe">Source</a>
-    </header>
-
-    <main id="top">
-      <section class="hero" aria-labelledby="hero-title">
-        <div class="hero-glow" aria-hidden="true"></div>
-
-        <div class="hero-copy">
-          <p class="eyebrow">Discord voice to text</p>
-          <h1 id="hero-title">Discord calls, written down.</h1>
-          <p class="lede">Create a bot. Configure a voice channel. Run the self-hosted worker.</p>
-          <div class="actions">
-            <a class="button primary" href="https://github.com/HazyForge/call-scribe">View source</a>
-            <a class="button quiet" href="#how">How it works</a>
-          </div>
-        </div>
-      </section>
-
-      <section id="how" class="steps" aria-label="How Call Scribe works">
-        <article>
-          <span>01</span>
-          <h2>Create</h2>
-          <p>Create and add your own Discord bot.</p>
-        </article>
-        <article>
-          <span>02</span>
-          <h2>Choose</h2>
-          <p>Select the channel to record.</p>
-        </article>
-        <article>
-          <span>03</span>
-          <h2>Store</h2>
-          <p>Retain transcripts on storage you operate.</p>
-        </article>
-      </section>
-
-      <section class="signal" aria-label="Call Scribe output">
-        <div class="signal-line" aria-hidden="true"></div>
-        <p>Recording, transcription, and clean handoff for the conversations you do not want to lose.</p>
-      </section>
-    </main>
-
-    <footer>
-      <span>Call Scribe · Apache-2.0</span>
-      <a href="https://github.com/HazyForge/call-scribe">GitHub</a>
-    </footer>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
