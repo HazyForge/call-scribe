@@ -1,149 +1,194 @@
+import { useEffect, useState } from "react";
+
 const GITHUB = "https://github.com/HazyForge/call-scribe";
 const README = "https://github.com/HazyForge/call-scribe#readme";
 
-const SHEETS = [
-  { id: "A-101", label: "Overview", active: true },
-  { id: "A-201", label: "Elevation" },
-  { id: "S-301", label: "Schedules" },
+const CHAPTERS = [
+  {
+    id: "capture",
+    label: "01 · Capture anatomy",
+    head: "What the recorder hears",
+    body: "A Discord voice channel, a phone line, a recording. Call Scribe joins, records whoever speaks, and stops when the channel empties — phone handoffs included. The raw audio becomes the source of truth. Oversized recordings are pre-split into ten-minute mono chunks before transcription, so a 43-minute architecture call never times out.",
+    artifact: ["# 2026-05-30 · arch-call", "", "> recording: hazy-trade-engineering.wav", "> speakers: 11 · duration: 47:32", "", "## The room"],
+  },
+  {
+    id: "structure",
+    label: "02 · Structure rules",
+    head: "Opinionated taxonomy",
+    body: "The analysis pass classifies every beat: Decision, Constraint, Open Question, Owner. Speaker turns render as diarized Markdown — who said what, in order. The taxonomy is opinionated on purpose: it is the same structure your repo can act on, the same headings a Codex task file consumes.",
+    artifact: ["## Decisions", "", "- [x] Shard the write path by session id", "- [x] Per-shard sequence numbers in audit", "- [ ] Recorder picks shard at open", "", "### Owners", "- @marcus · migration"],
+  },
+  {
+    id: "commit",
+    label: "03 · Repo-local commit",
+    head: "Filed where the work happens",
+    body: "The manuscript lands in your tree — transcript, architecture brief, analysis, and a Codex task file. Not a silo, not a dashboard: docs/meetings in the repo where the implementation will happen. Self-hosted with Docker Compose or on Kubernetes; the audio and the writing never leave your infrastructure.",
+    artifact: ["+ docs/meetings/2026-05-30-arch-call/", "+   transcript.md", "+   architecture-brief.md", "+   analysis.json", "+   codex-task.md"],
+  },
+  {
+    id: "loop",
+    label: "04 · Playback → edit loop",
+    head: "From call to code",
+    body: "Every meeting ends with a task file your coding agent consumes directly — codex-task.md. The decision becomes the diff, the diff becomes the code, and the code is what the next architecture call reviews. That is the loop that makes the call count.",
+    artifact: ["$ codex docs/meetings/2026-05-30-arch-call/codex-task.md", "", "  # implement the sharded write path", "  # from this call", "  ✔ 12 files changed · 4 tests added"],
+  },
 ];
 
-const CALLERS = [
-  { tag: "SPK-01", who: "erin", text: "The write path is the bottleneck — two of three workers block on the same WAL." },
-  { tag: "SPK-02", who: "marcus", text: "Proposal: shard by session id, let the recorder pick a shard at open." },
-  { tag: "SPK-01", who: "erin", text: "That changes the audit contract. Per-shard sequence numbers?" },
-  { tag: "SPK-02", who: "marcus", text: "Yes — add them. Old path behind a flag for one release." },
+const METRICS = [
+  { k: "local-only", v: "audio + transcripts never leave your infra" },
+  { k: "your models", v: "bring your own STT, bring your own repo" },
+  { k: "your tree", v: "markdown files, not a product silo" },
 ];
 
-const CALLOUTS = [
-  { tag: "DECISION", note: "Shard write path by session id; per-shard sequence numbers in audit." },
-  { tag: "ACTION", note: "marcus: draft migration; feature flag for one release." },
-  { tag: "RISK", note: "Recorder picks shard at open vs first flush — resolve before cutover." },
-];
-
-const SCHEDULE = [
-  { item: "docs/meetings/2026-05-30-arch-call/transcript.md", spec: "diarized, per speaker", status: "ISSUED" },
-  { item: "architecture-brief.md", spec: "decisions + tradeoffs", status: "ISSUED" },
-  { item: "analysis.json", spec: "actions, risks, repo updates", status: "ISSUED" },
-  { item: "codex-task.md", spec: "handoff task for implementation", status: "ISSUED" },
-];
+function useActiveChapter() {
+  const [active, setActive] = useState(0);
+  useEffect(() => {
+    const els = CHAPTERS.map((c) => document.getElementById(`ch-${c.id}`));
+    const onScroll = () => {
+      const probe = window.innerHeight * 0.35;
+      let best = 0;
+      let bestDist = Infinity;
+      els.forEach((el, i) => {
+        if (!el) return;
+        const r = el.getBoundingClientRect();
+        if (r.top <= probe && r.bottom >= probe) {
+          best = i;
+          bestDist = 0;
+          return;
+        }
+        const d = Math.min(Math.abs(r.top - probe), Math.abs(r.bottom - probe));
+        if (d < bestDist) {
+          bestDist = d;
+          best = i;
+        }
+      });
+      setActive(best);
+    };
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+  return active;
+}
 
 export default function HomePage() {
+  const active = useActiveChapter();
   return (
-    <main className="blueprint">
-      {/* Sheet tabs */}
-      <nav className="sheet-tabs">
-        <div className="sheet-tabs-inner">
-          {SHEETS.map((s) => (
-            <a key={s.id} className={"sheet-tab mono" + (s.active ? " active" : "")} href={s.active ? "#top" : "#top"}>
-              <span className="sheet-tab-id">{s.id}</span>
-              <span className="sheet-tab-label">{s.label}</span>
-            </a>
-          ))}
+    <main>
+      {/* Cinematic hero */}
+      <section className="hero">
+        <div className="hero-media" aria-hidden="true">
+          <img className="hero-poster" src="/hero/hero-poster.jpg" alt="" fetchPriority="high" decoding="async" />
+          <video className="hero-video" autoPlay muted loop playsInline preload="auto" poster="/hero/hero-poster.jpg" tabIndex={-1}>
+            <source src="/hero/hero.mp4" type="video/mp4" />
+          </video>
         </div>
-      </nav>
-
-      {/* Title block hero */}
-      <section id="top" className="plan">
-        <div className="plan-inner">
-          <div className="plan-head">
-            <p className="plan-kicker mono">Project · Call Scribe — architecture calls to repo memory</p>
-            <h1 className="plan-title">
-              Sheet A-101 — <span className="plan-accent">the call, drawn to scale</span>
+        <div className="hero-scrim" aria-hidden="true" />
+        <div className="hero-inner">
+          <div className="hero-copy">
+            <div className="eyebrow">Open source · Rust CLI</div>
+            <h1 className="display hero-title">
+              <span>Call</span>
+              <span className="hero-accent">Scribe</span>
             </h1>
-            <p className="plan-lead">
-              Every architecture call is a set of details that gets lost. Call Scribe records the call,
-              diarizes the speakers, and issues the working drawings: a Markdown transcript, an architecture
-              brief, decisions and actions — and a Codex task sheet for the implementation. Filed in your repo
-              at the correct scale.
+            <p className="hero-tagline">Voices become <em>memory</em></p>
+            <p className="hero-lead">
+              Call Scribe records architecture calls and writes them down — diarized transcripts,
+              decisions, action items, and a Codex-ready handoff, filed in your repo as durable
+              Markdown memory.
             </p>
-            <div className="plan-cta">
+            <div className="hero-cta">
               <a className="btn btn-primary" href={README}>Read the docs</a>
               <a className="btn btn-ghost" href={GITHUB}>View on GitHub</a>
             </div>
           </div>
-          <figure className="plot-plate">
-            <div className="plot-media">
-              <img src="/hero/hero-poster.jpg" alt="" loading="eager" />
-              <video autoPlay muted loop playsInline poster="/hero/hero-poster.jpg" tabIndex={-1}>
-                <source src="/hero/hero.mp4" type="video/mp4" />
-              </video>
-            </div>
-            <figcaption className="mono">Fig. A-101 — the recorder plotting the session</figcaption>
-          </figure>
-        </div>
-        {/* dimension bar */}
-        <div className="dimension-bar mono" aria-hidden="true">
-          <span>0</span><span className="dim-tick" /><span>1</span><span className="dim-tick" /><span>2</span><span className="dim-tick" /><span>3</span><span className="dim-tick" /><span>4</span><span className="dim-tick" /><span>5</span><span className="dim-tick" /><span>6</span>
         </div>
       </section>
 
-      {/* Elevation — transcript */}
-      <section className="elevation">
-        <div className="section-head mono">Sheet A-201 · Elevation — speaker trace</div>
-        <div className="elevation-lines">
-          {CALLERS.map((c) => (
-            <div key={c.tag + c.who + c.text} className="call-line">
-              <span className="call-tag mono">{c.tag}</span>
-              <span className={`call-who call-${c.who}`}>{c.who}</span>
-              <span className="call-text">{c.text}</span>
-            </div>
-          ))}
-        </div>
+      {/* Manifesto band — no cards */}
+      <section className="manifesto">
+        <p className="manifesto-text">
+          The best architecture discussion happens in a voice channel — and then{" "}
+          <em>it evaporates.</em> We built the notebook that doesn't forget.
+        </p>
       </section>
 
-      {/* Detail callouts — decisions */}
-      <section className="details">
-        <div className="section-head mono">Detail callouts — decisions &amp; actions</div>
-        <div className="callout-grid">
-          {CALLOUTS.map((c) => (
-            <div key={c.tag} className="callout">
-              <span className={`callout-tag mono tag-${c.tag.toLowerCase()}`}>{c.tag}</span>
-              <span className="callout-note">{c.note}</span>
+      {/* Spine */}
+      <section className="spine">
+        <aside className="spine-manuscript" aria-hidden="false">
+          <div className="ms-head mono">
+              <span className="ms-rec" aria-hidden="true" />
+              <span>writing docs/meetings/2026-05-30-arch-call/transcript.md</span>
             </div>
-          ))}
-        </div>
-      </section>
-
-      {/* Schedules — repo artifacts */}
-      <section className="schedules">
-        <div className="section-head mono">Sheet S-301 · Schedule of issued documents</div>
-        <div className="schedule-table">
-          {SCHEDULE.map((s) => (
-            <div key={s.item} className="schedule-row">
-              <span className="schedule-item mono">{s.item}</span>
-              <span className="schedule-spec">{s.spec}</span>
-              <span className="schedule-status mono">{s.status}</span>
-            </div>
-          ))}
-        </div>
-        <div className="handoff-note">
-          Every meeting ends with a file your coding agent can consume directly —
-          <span className="mono handoff-cmd">codex docs/meetings/…/codex-task.md</span>
-        </div>
-      </section>
-
-      {/* Revision cloud / install */}
-      <section className="revision">
-        <div className="revision-cloud">
-          <div>
-            <h2 className="revision-title">Revision cloud — install Call Scribe</h2>
-            <p className="revision-sub">
-              Apache-2.0, self-hosted, Docker Compose or Kubernetes. The drawings stay in your repo.
-            </p>
+          <div className="ms-body mono">
+            {active === 0 ? (
+              <div className="ms-standby">
+                <span className="ms-caret" aria-hidden="true" />
+                <span className="ms-standby-text">recorder is listening — the transcript writes itself as you scroll</span>
+              </div>
+            ) : null}
+            {CHAPTERS.slice(0, active + 1).map((c, ci) => (
+              <div key={c.id} className={"ms-block" + (ci === active ? " is-active" : "")}>
+                {c.artifact.map((line, li) => (
+                  <div key={li} className={line.startsWith("- [x]") || line.startsWith("+") ? "ms-diff" : line.startsWith(">") ? "ms-quote" : ""}>
+                    {line === "" ? " " : line}
+                  </div>
+                ))}
+                {ci === active ? <span className="ms-caret" aria-hidden="true" /> : null}
+              </div>
+            ))}
           </div>
-          <div className="revision-cmd mono"><span>$</span> docker compose up -d</div>
+        </aside>
+        <div className="spine-chapters">
+          {CHAPTERS.map((c) => (
+            <article key={c.id} id={`ch-${c.id}`} className="chapter">
+              <div className="mono chapter-label">{c.label}</div>
+              <h2 className="display chapter-title">{c.head}</h2>
+              <p className="chapter-body">{c.body}</p>
+            </article>
+          ))}
         </div>
       </section>
 
-      {/* Title block footer */}
-      <footer className="titleblock">
-        <div className="titleblock-grid mono">
-          <span>PROJECT: CALL SCRIBE</span>
-          <span>SCALE: 1 CALL = 1 MEMO</span>
-          <span>SHEET: A-101</span>
-          <span>DATE: {new Date().getFullYear()}</span>
-          <span>DRAWN BY: HAZY FORGE</span>
-          <span className="tb-links"><a href={GITHUB}>GITHUB</a> · <a href="https://hazyforge.io">HAZYFORGE.IO</a></span>
+      {/* Trust strip */}
+      <section className="trust">
+        {METRICS.map((m) => (
+          <div key={m.k} className="trust-item">
+            <span className="mono trust-key">{m.k}</span>
+            <span className="trust-value">{m.v}</span>
+          </div>
+        ))}
+      </section>
+
+      {/* Folio CTA */}
+      <section className="folio">
+        <div className="folio-inner">
+          <p className="eyebrow">Open source · Apache-2.0</p>
+          <h2 className="display folio-title">
+            Open a line.
+            <span className="soft"> Keep the memory.</span>
+          </h2>
+          <p className="folio-sub">
+            Self-hosted with Docker Compose or on Kubernetes. The drawings, transcripts, and decisions
+            stay in your repo — yours to keep.
+          </p>
+          <div className="folio-actions">
+            <a className="btn btn-primary" href={README}>Read the docs</a>
+            <a className="btn btn-ghost" href={GITHUB}>View on GitHub</a>
+          </div>
+        </div>
+      </section>
+
+      <footer className="site-footer">
+        <div className="site-footer-inner">
+          <div className="mono footer-meta">
+            <span>© {new Date().getFullYear()} Hazy Forge</span>
+            <span>call-scribe.hazyforge.io</span>
+          </div>
+          <div className="footer-links mono">
+            <a href={GITHUB}>GitHub</a>
+            <a href="https://hazyforge.io">Hazy Forge</a>
+          </div>
         </div>
       </footer>
     </main>

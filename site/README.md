@@ -2,15 +2,9 @@
 
 Marketing site for Call Scribe — **https://call-scribe.hazyforge.io**.
 
-## Direction (Sheet A-101 blueprint)
+## Direction (Archive of Voice — cinematic)
 
-Drafting-sheet world: sheet tabs (A-101/A-201/S-301), condensed sheet titles, plotter-video plate,
-speaker-trace elevation, decision/action/risk callouts, issued-documents schedule, revision-cloud install,
-title-block footer. Saira Condensed + Saira + Chivo Mono. Palette #163A7A / #E8F1FA / #FF5A36 / #F5C445.
-
-## Local / container
-
-```bash
-cd site && pnpm install && pnpm dev
-docker build -f site/Dockerfile -t ghcr.io/hazyforge/call-scribe-site:dev .
-```
+Full-bleed cinematic hero film (amber waveform unraveling into hanging manuscript pages in a violet archive),
+manifesto band, then an "artifact spine": sticky left manuscript that writes itself as you scroll beside
+right-side chapters (capture anatomy / structure rules / repo-local commit / playback loop), metrics rail,
+folio CTA. Barlow/Manrope/IBM Plex Mono; #0d0a16/#ffb454/#ff7a3d/#fff1e0.
