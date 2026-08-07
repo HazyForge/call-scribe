@@ -1,206 +1,206 @@
-import HeroCinematic from "../components/HeroCinematic";
-
 const GITHUB = "https://github.com/HazyForge/call-scribe";
 const README = "https://github.com/HazyForge/call-scribe#readme";
 
-const WHY = [
+const STEPS = [
   {
-    label: "Captures the room",
+    n: "01",
+    title: "The call happens",
     detail:
-      "Joins your Discord voice channel, records whoever speaks, and stops when the channel empties — phone handoffs included.",
+      "A Discord voice channel, a phone line, a recording. Nobody remembers to take minutes; the meeting evaporates.",
   },
   {
-    label: "Diarized transcripts",
+    n: "02",
+    title: "Call Scribe records",
     detail:
-      "Speaker turns render as Markdown: who said what, in order, saved straight to docs/meetings in your repo.",
+      "The bot joins the channel, records whoever speaks, and stops when the channel empties — phone handoffs included.",
   },
   {
-    label: "Action items",
+    n: "03",
+    title: "It writes the field notes",
     detail:
-      "The analysis pass extracts decisions, action items, and repo update suggestions — structured for review, not buried in a recording.",
+      "Diarized speaker turns become Markdown: who said what, in order, with decisions and action items pulled out.",
   },
   {
-    label: "Codex-ready handoff",
+    n: "04",
+    title: "The repo keeps them",
     detail:
-      "Every meeting ends with a task file your coding agent can consume to turn the call into implementation.",
+      "A transcript plus a Codex-ready task file land in docs/meetings — durable memory where the work will happen.",
   },
 ];
 
-const PIPELINE = [
-  {
-    name: "Capture",
-    detail:
-      "Discord voice or a Twilio recording webhook. One channel, no push-to-talk, no one remembers to hit record.",
-  },
-  {
-    name: "Transcribe",
-    detail:
-      "Diarized STT with speaker turns; oversized recordings auto-split into chunks that never time out.",
-  },
-  {
-    name: "Analyze",
-    detail:
-      "Decisions, action items, and an architecture brief — a structured Markdown package for the repo.",
-  },
-  {
-    name: "Hand off",
-    detail:
-      "A transcript plus a Codex task file land in repo-local memory, ready for the next implementation session.",
-  },
+const EXCERPT = [
+  { who: "erin", text: "So the write path is the bottleneck — two of the three workers block on the same WAL." },
+  { who: "marcus", text: "Agreed. Proposal: shard by session id and let the recorder pick a shard at open." },
+  { who: "erin", text: "That changes the audit contract though. We'd need per-shard sequence numbers." },
+  { who: "marcus", text: "Right — add them. I'll draft the migration; keep the old path behind a flag for one release." },
+];
+
+const DECISIONS = [
+  { tag: "DECIDED", text: "Shard the write path by session id; per-shard sequence numbers in the audit log." },
+  { tag: "ACTION", text: "marcus — draft the migration; old path behind a flag for one release." },
+  { tag: "OPEN", text: "Whether the recorder should pick a shard at open or at first flush." },
 ];
 
 export default function HomePage() {
   return (
-    <main>
-      <section className="hero">
-        <HeroCinematic />
-        <div className="hero-scrim" aria-hidden="true" />
-        <div className="container hero-inner">
-          <div className="hero-copy">
-            <div className="eyebrow">Open source · Rust CLI</div>
-            <h1 className="display hero-title">
-              <span>Call</span>
-              <span className="hero-title-accent">Scribe</span>
-            </h1>
-            <p className="hero-tagline">
-              Meetings become <em>memory</em>
-            </p>
-            <p className="hero-lead">
-              Call Scribe records architecture calls, transcribes them with
-              diarized speaker turns, and lands the result in your repo as
-              durable Markdown memory — transcripts, decisions, action items,
-              and a Codex-ready handoff task.
-            </p>
-            <div className="hero-chips">
-              <span className="chip">
-                <span className="chip-dot" />
-                v0.1 live
-              </span>
-              <span className="chip">Diarized</span>
-              <span className="chip">Markdown</span>
-              <span className="chip">Codex-ready</span>
-            </div>
-            <div className="hero-cta">
-              <a className="btn btn-primary" href={README}>
-                Read the docs
-              </a>
-              <a className="btn btn-ghost" href={GITHUB}>
-                View on GitHub
-              </a>
-            </div>
-          </div>
+    <main className="fieldnotes">
+      {/* Masthead */}
+      <header className="masthead">
+        <div className="masthead-row container">
+          <span className="masthead-brand">Call Scribe</span>
+          <span className="masthead-rule" aria-hidden="true" />
+          <span className="masthead-meta">Field Notes, Vol. 1 · architecture calls to repo memory</span>
+          <span className="masthead-rule" aria-hidden="true" />
+          <span className="masthead-meta mono">v0.1 · sha-9f316c5</span>
         </div>
-        <div className="hero-ticker" aria-hidden="true">
-          <div className="container hero-ticker-inner">
-            <span className="mono hero-ticker-label">Channel</span>
-            <div className="hero-ticker-runs">
-              <span className="ticker-run">
-                <span className="ticker-dot live" />
-                <span className="ticker-name mono">hazy-trade sync</span>
-                <span className="ticker-phase">Recording</span>
-              </span>
-              <span className="ticker-run">
-                <span className="ticker-dot" />
-                <span className="ticker-name mono">arch-call 2026-05-30</span>
-                <span className="ticker-phase">Transcribed</span>
-              </span>
-              <span className="ticker-run">
-                <span className="ticker-dot" />
-                <span className="ticker-name mono">onboarding deep-dive</span>
-                <span className="ticker-phase">Filed</span>
-              </span>
-              <span className="ticker-run">
-                <span className="ticker-dot" />
-                <span className="ticker-name mono">release retro</span>
-                <span className="ticker-phase">Filed</span>
-              </span>
+        <nav className="masthead-nav container mono">
+          <a href="#thesis">Thesis</a>
+          <a href="#transcript">Transcript</a>
+          <a href="#workflow">Workflow</a>
+          <a href="#handoff">Handoff</a>
+          <a href={GITHUB}>Source</a>
+        </nav>
+      </header>
+
+      {/* Thesis */}
+      <section id="thesis" className="section thesis container">
+        <p className="kicker">An open-source field recorder for engineering meetings</p>
+        <h1 className="thesis-title">
+          The best architecture discussion happens in a voice channel — and then
+          <em> it evaporates.</em>
+        </h1>
+        <p className="thesis-lead">
+          Call Scribe is the notebook that doesn't forget. It records your calls, writes them down with
+          diarized speaker turns, and files the result in your repo as durable Markdown memory — decisions,
+          action items, and a Codex-ready handoff, exactly where the work will actually happen.
+        </p>
+        <div className="thesis-actions">
+          <a className="btn btn-primary" href={README}>Read the docs</a>
+          <a className="btn btn-ghost" href={GITHUB}>View on GitHub</a>
+        </div>
+      </section>
+
+      {/* Annotated transcript — the inset video plate + handwritten excerpt */}
+      <section id="transcript" className="section transcript-wrap">
+        <div className="container">
+          <div className="section-label mono">Plate 01 — the transcript</div>
+          <div className="transcript-grid">
+            <figure className="plate">
+              <div className="plate-media">
+                <img src="/hero/hero-poster.jpg" alt="" loading="eager" />
+                <video autoPlay muted loop playsInline poster="/hero/hero-poster.jpg" tabIndex={-1}>
+                  <source src="/hero/hero.mp4" type="video/mp4" />
+                </video>
+              </div>
+              <figcaption className="mono">fig. 1 — the recorder at work, annotated in the margin</figcaption>
+            </figure>
+            <div className="notebook">
+              <div className="notebook-head mono">
+                <span>2026-05-30 · arch-call</span>
+                <span>11 speakers</span>
+              </div>
+              <div className="notebook-lines">
+                {EXCERPT.map((t) => (
+                  <p key={t.who + t.text} className="note-line">
+                    <span className={`note-who note-${t.who}`}>{t.who}</span>
+                    <span className="note-text">{t.text}</span>
+                  </p>
+                ))}
+              </div>
+              <div className="notebook-notes mono">
+                <span className="scribble">→ shard the write path</span>
+                <span className="scribble scribble-rust">!! audit contract</span>
+                <span className="scribble">decision: shard by session</span>
+              </div>
+              <div className="notebook-stamp mono">Filed · docs/meetings/2026-05-30-arch-call.md</div>
             </div>
           </div>
         </div>
       </section>
 
-      <section id="why" className="section">
-        <div className="container">
-          <div className="section-head">
-            <div className="eyebrow">Why we built it</div>
-            <h2 className="display section-title">
-              The call is where
-              <span className="soft"> decisions happen</span>
-            </h2>
-            <p className="section-lead">
-              The best architecture discussion lives in a voice channel, then
-              evaporates. Call Scribe keeps the parts that matter — what was
-              decided, who said it, and what happens next — as durable,
-              searchable memory in the repo where the work will actually
-              happen.
-            </p>
+      {/* Workflow — numbered folio steps */}
+      <section id="workflow" className="section workflow container">
+        <div className="section-label mono">Folio 02 — from conversation to commit</div>
+        <div className="steps">
+          {STEPS.map((s) => (
+            <article key={s.n} className="step">
+              <div className="step-n mono">{s.n}</div>
+              <h3 className="step-title">{s.title}</h3>
+              <p className="step-detail">{s.detail}</p>
+            </article>
+          ))}
+        </div>
+      </section>
+
+      {/* Repo preview + decisions */}
+      <section className="section repo container">
+        <div className="section-label mono">Folio 03 — what lands in the repo</div>
+        <div className="repo-grid">
+          <div className="filetree panel">
+            <div className="panel-head mono">docs/meetings/2026-05-30-arch-call/</div>
+            <ul className="tree mono">
+              <li>transcript.md</li>
+              <li>architecture-brief.md</li>
+              <li>analysis.json</li>
+              <li className="tree-accent">codex-task.md</li>
+              <li>raw-stt-response.json</li>
+            </ul>
           </div>
-          <div className="highlight-grid">
-            {WHY.map((item, index) => (
-              <article key={item.label} className="panel highlight-card">
-                <div className="mono highlight-index">
-                  {String(index + 1).padStart(2, "0")}
-                </div>
-                <h3 className="display highlight-title">{item.label}</h3>
-                <p>{item.detail}</p>
-              </article>
+          <div className="decisions panel">
+            <div className="panel-head mono">what the call decided</div>
+            {DECISIONS.map((d) => (
+              <div key={d.tag} className="decision-row">
+                <span className={`decision-tag mono tag-${d.tag.toLowerCase()}`}>{d.tag}</span>
+                <span className="decision-text">{d.text}</span>
+              </div>
             ))}
           </div>
         </div>
       </section>
 
-      <section id="pipeline" className="section section-alt">
-        <div className="container">
-          <div className="section-head">
-            <div className="eyebrow">Pipeline</div>
-            <h2 className="display section-title">
-              Small steps.
-              <span className="soft"> Durable memory.</span>
-            </h2>
-            <p className="section-lead">
-              Call Scribe is a single CLI: point it at a recording (or a
-              channel) and a target repo, and the whole path from audio to
-              repo-local memory runs end to end.
-            </p>
-          </div>
-          <div className="composition-grid">
-            {PIPELINE.map((item) => (
-              <article key={item.name} className="panel composition-card">
-                <h3 className="display composition-title">{item.name}</h3>
-                <p>{item.detail}</p>
-              </article>
-            ))}
-          </div>
+      {/* Handoff checklist */}
+      <section id="handoff" className="section handoff container">
+        <div className="section-label mono">Folio 04 — the handoff</div>
+        <div className="handoff-card">
+          <p className="handoff-lead">
+            Every meeting ends with a file your coding agent can consume directly:
+          </p>
+          <pre className="code-block"><code>{`codex docs/meetings/2026-05-30-arch-call/codex-task.md
+# "implement the sharded write path from this call"`}</code></pre>
+          <p className="handoff-note">
+            The transcript preserves who said what; the analysis extracts decisions and action items; the task
+            file turns the call into implementation. Nothing lives in a silo.
+          </p>
         </div>
       </section>
 
-      <section id="docs" className="section">
-        <div className="container panel cta-panel">
+      {/* Install tear-strip */}
+      <section className="section install">
+        <div className="container install-strip">
           <div>
-            <div className="eyebrow">Open source</div>
-            <h2 className="display section-title">
-              Install, capture,
-              <span className="soft"> remember</span>
-            </h2>
-            <p className="section-lead">
-              Apache-2.0, self-hosted, and deployable with Docker Compose or on
-              Kubernetes. Recordings and transcripts stay yours — in your
-              cluster, your storage, your repo.
+            <h2 className="install-title">Open a line, keep the memory.</h2>
+            <p className="install-sub">
+              Apache-2.0, self-hosted, and deployable with Docker Compose or on Kubernetes. Recordings and
+              transcripts stay yours.
             </p>
           </div>
-          <div className="cta-actions">
-            <a className="btn btn-primary" href={README}>
-              Read the docs
-            </a>
-            <a className="btn btn-ghost" href={GITHUB}>
-              View on GitHub
-            </a>
-            <a className="btn btn-ghost" href="https://github.com/HazyForge/call-scribe/releases">
-              Releases
-            </a>
+          <div className="install-cmd mono">
+            <span>$</span> docker compose up -d
           </div>
         </div>
       </section>
+
+      {/* Colophon */}
+      <footer className="colophon container">
+        <p className="colophon-line">
+          © {new Date().getFullYear()} Hazy Forge · set in Fraunces &amp; Source Sans 3 · field notes are
+          memory, not meetings
+        </p>
+        <p className="colophon-links mono">
+          <a href={GITHUB}>github.com/HazyForge/call-scribe</a>
+          <a href="https://hazyforge.io">hazyforge.io</a>
+        </p>
+      </footer>
     </main>
   );
 }
