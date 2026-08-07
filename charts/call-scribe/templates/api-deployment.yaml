@@ -74,6 +74,16 @@ spec:
             - name: CALL_SCRIBE_OIDC_AUDIENCE
               value: {{ .Values.api.oidcAudience | quote }}
             {{- end }}
+            {{- if .Values.api.openaiBaseUrl }}
+            - name: OPENAI_BASE_URL
+              value: {{ .Values.api.openaiBaseUrl | quote }}
+            - name: OPENAI_STT_BASE_URL
+              value: {{ .Values.api.openaiBaseUrl | quote }}
+            {{- end }}
+            {{- if .Values.api.openaiModel }}
+            - name: OPENAI_MODEL
+              value: {{ .Values.api.openaiModel | quote }}
+            {{- end }}
             - name: ELEVENLABS_STT_TIMEOUT_SECONDS
               value: {{ .Values.config.sttTimeoutSeconds | quote }}
             - name: ELEVENLABS_STT_DIARIZE

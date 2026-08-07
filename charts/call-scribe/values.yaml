@@ -41,6 +41,8 @@ api:
   devAuthSub: ""
   oidcIssuer: ""
   oidcAudience: ""
+  openaiBaseUrl: "https://codex.hazycloud.io/v1"
+  openaiModel: "gpt-5.4"
   resources:
     requests:
       cpu: 100m
