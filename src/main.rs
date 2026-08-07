@@ -1184,6 +1184,7 @@ fn install_rustls_crypto_provider() {
 }
 
 #[cfg(feature = "discord")]
+#[allow(clippy::too_many_arguments)]
 async fn handle_captured_session(
     session: CapturedSession,
     provider: &SttProvider,
@@ -1259,6 +1260,7 @@ async fn handle_captured_session(
 }
 
 #[cfg(feature = "discord")]
+#[allow(clippy::too_many_arguments)]
 async fn handle_captured_session_inner(
     session: &CapturedSession,
     provider: &SttProvider,
