@@ -328,7 +328,7 @@ dependencies = [
  "hound",
  "jsonwebtoken",
  "mime_guess",
- "rand 0.9.5",
+ "rand 0.10.2",
  "reqwest 0.13.4",
  "rustls",
  "schemars",
