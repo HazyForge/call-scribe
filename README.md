@@ -7,14 +7,9 @@ Call Scribe is an Apache-2.0 open-source Discord voice capture and transcription
 > [!IMPORTANT]
 > Call Scribe does not implement participant consent notices for you. The Discord worker can start automatically when a configured channel becomes occupied. Operators must provide legally appropriate notice and obtain consent before recording or transcription.
 
-Open the landing page locally:
-
-```bash
-cd site
-python3 -m http.server 4173
-```
-
-Then visit `http://localhost:4173`.
+> The marketing site source lives in a separate **private** repository
+> (`HazyForge/call-scribe-site`) and is intentionally not part of this
+> open-source project.
 
 The first working path is intentionally simple:
 
