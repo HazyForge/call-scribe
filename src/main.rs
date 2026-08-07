@@ -120,6 +120,10 @@ struct ServeArgs {
     #[arg(long, env = "CALL_SCRIBE_MEETINGS_DIR", default_value = "meetings")]
     meetings_dir: PathBuf,
 
+    /// Directory containing the management UI (`index.html` + `assets/`).
+    #[arg(long, env = "CALL_SCRIBE_WEB_DIR", default_value = "web")]
+    web_dir: PathBuf,
+
     /// STT provider used by the Transcribe action.
     #[arg(long, env = "CALL_SCRIBE_STT_PROVIDER", value_enum, default_value_t = SttProvider::ElevenLabs)]
     provider: SttProvider,
@@ -860,6 +864,7 @@ async fn main() -> Result<()> {
                 &args.database_url,
                 &args.bind,
                 args.meetings_dir,
+                args.web_dir,
                 args.provider,
                 args.organization_id,
                 args.dev_auth_sub,

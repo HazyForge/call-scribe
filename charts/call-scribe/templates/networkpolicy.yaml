@@ -9,7 +9,9 @@ spec:
   podSelector:
     matchLabels:
       {{- include "call-scribe.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
   policyTypes:
     - Ingress
   ingress: []
 {{- end }}
+

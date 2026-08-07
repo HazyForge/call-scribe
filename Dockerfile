@@ -32,7 +32,9 @@ RUN apt-get update \
 COPY --from=builder /workspace/target/release/call-scribe /usr/local/bin/call-scribe
 COPY LICENSE /usr/share/doc/call-scribe/LICENSE
 COPY --from=builder /workspace/THIRD_PARTY_LICENSES.html /usr/share/doc/call-scribe/THIRD_PARTY_LICENSES.html
+COPY web /usr/share/call-scribe/web
 
 USER callscribe
 WORKDIR /app
+ENV CALL_SCRIBE_WEB_DIR=/usr/share/call-scribe/web
 ENTRYPOINT ["call-scribe"]

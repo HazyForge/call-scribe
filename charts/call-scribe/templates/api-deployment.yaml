@@ -1,29 +1,24 @@
-{{- if and .Values.image.requireDigest (gt (int .Values.replicaCount) 0) (not .Values.image.digest) }}
-{{- fail "image.digest must be pinned before replicaCount is greater than zero" }}
-{{- end }}
+{{- if .Values.api.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "call-scribe.fullname" . }}
+  name: {{ include "call-scribe.fullname" . }}-api
   labels:
     {{- include "call-scribe.labels" . | nindent 4 }}
-    app.kubernetes.io/component: worker
+    app.kubernetes.io/component: api
 spec:
-  replicas: {{ .Values.replicaCount }}
-  strategy:
-    type: Recreate
+  replicas: {{ .Values.api.replicaCount }}
   selector:
     matchLabels:
       {{- include "call-scribe.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: worker
+      app.kubernetes.io/component: api
   template:
     metadata:
       labels:
         {{- include "call-scribe.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: worker
+        app.kubernetes.io/component: api
     spec:
       automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
-      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -37,41 +32,64 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
-        - name: call-scribe
+        - name: call-scribe-api
           image: {{ include "call-scribe.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
-            - discord
-            - --repo
-            - /meetings
-            {{- if .Values.config.skipAnalysis }}
-            - --skip-analysis
-            {{- end }}
+            - serve
+          ports:
+            - name: http
+              containerPort: {{ .Values.api.port }}
           envFrom:
             - secretRef:
                 name: {{ .Values.providerCredentials.existingSecret | quote }}
+                optional: true
           env:
             - name: CALL_SCRIBE_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.database.existingSecret | quote }}
                   key: {{ .Values.database.urlKey | quote }}
-            - name: CALL_SCRIBE_CAPTURE_DIR
-              value: {{ .Values.config.captureDir | quote }}
-            - name: CALL_SCRIBE_OUTPUT_DIR
-              value: {{ .Values.config.outputDir | quote }}
+            - name: CALL_SCRIBE_API_BIND
+              value: {{ printf "0.0.0.0:%v" .Values.api.port | quote }}
+            - name: CALL_SCRIBE_MEETINGS_DIR
+              value: {{ .Values.api.meetingsDir | quote }}
+            - name: CALL_SCRIBE_WEB_DIR
+              value: {{ .Values.api.webDir | quote }}
             - name: CALL_SCRIBE_STT_PROVIDER
               value: {{ .Values.config.sttProvider | quote }}
-            - name: CALL_SCRIBE_CAPTURE_MODE
-              value: {{ .Values.config.captureMode | quote }}
             - name: CALL_SCRIBE_ORGANIZATION_ID
               value: {{ .Values.config.organizationId | quote }}
+            - name: CALL_SCRIBE_CAPTURE_MODE
+              value: {{ .Values.config.captureMode | quote }}
+            {{- if .Values.api.devAuthSub }}
+            - name: CALL_SCRIBE_DEV_AUTH_SUB
+              value: {{ .Values.api.devAuthSub | quote }}
+            {{- end }}
+            {{- if .Values.api.oidcIssuer }}
+            - name: CALL_SCRIBE_OIDC_ISSUER
+              value: {{ .Values.api.oidcIssuer | quote }}
+            {{- end }}
+            {{- if .Values.api.oidcAudience }}
+            - name: CALL_SCRIBE_OIDC_AUDIENCE
+              value: {{ .Values.api.oidcAudience | quote }}
+            {{- end }}
             - name: ELEVENLABS_STT_TIMEOUT_SECONDS
               value: {{ .Values.config.sttTimeoutSeconds | quote }}
             - name: ELEVENLABS_STT_DIARIZE
               value: {{ .Values.config.sttDiarize | quote }}
-            - name: ELEVENLABS_STT_TIMESTAMPS_GRANULARITY
-              value: {{ .Values.config.sttTimestampsGranularity | quote }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -84,14 +102,14 @@ spec:
             - name: tmp
               mountPath: /tmp
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
+            {{- toYaml .Values.api.resources | nindent 12 }}
       volumes:
         - name: meetings
           persistentVolumeClaim:
             claimName: {{ include "call-scribe.fullname" . }}
         - name: tmp
           emptyDir:
-            sizeLimit: 2Gi
+            sizeLimit: 1Gi
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -104,3 +122,4 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+{{- end }}

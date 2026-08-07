@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Call Scribe</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230b1220'/%3E%3Cpath d='M12 36c4-10 8-16 12-16s6 8 10 16 8 16 12 16 8-6 12-16' stroke='%2356f0c8' stroke-width='4' fill='none' stroke-linecap='round'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="mark" aria-hidden="true"></div>
+          <div>
+            <div class="brand-name">Call Scribe</div>
+            <div class="brand-sub">Recording control plane</div>
+          </div>
+        </div>
+        <div class="top-meta">
+          <span id="user-label" class="pill muted">Not signed in</span>
+          <span id="org-label" class="pill">—</span>
+        </div>
+      </header>
+
+      <section id="auth-panel" class="card auth-card">
+        <h1>Sign in</h1>
+        <p class="lede">
+          Private alpha uses a ZITADEL subject (or local dev subject) to load org
+          memberships. Paste your bearer token, or use the configured dev subject.
+        </p>
+        <label class="field">
+          <span>Bearer token / dev subject</span>
+          <input id="token-input" type="password" autocomplete="off" placeholder="dev subject or JWT" />
+        </label>
+        <div class="row">
+          <button id="btn-sign-in" class="btn primary" type="button">Continue</button>
+          <button id="btn-clear-auth" class="btn ghost" type="button">Clear</button>
+        </div>
+        <p id="auth-error" class="error" hidden></p>
+      </section>
+
+      <main id="app-main" class="layout" hidden>
+        <nav class="tabs" role="tablist">
+          <button class="tab active" data-tab="recordings" type="button">Recordings</button>
+          <button class="tab" data-tab="transcripts" type="button">Transcripts</button>
+        </nav>
+
+        <section id="panel-recordings" class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Recordings</h2>
+              <p class="lede">Captured Discord audio waiting for or after transcription.</p>
+            </div>
+            <button id="btn-refresh-recordings" class="btn ghost" type="button">Refresh</button>
+          </div>
+          <div id="recordings-empty" class="empty" hidden>No recordings yet.</div>
+          <div id="recordings-list" class="list"></div>
+        </section>
+
+        <section id="panel-transcripts" class="panel" hidden>
+          <div class="panel-head">
+            <div>
+              <h2>Transcripts</h2>
+              <p class="lede">Transcription jobs and completed Markdown artifacts.</p>
+            </div>
+            <button id="btn-refresh-transcripts" class="btn ghost" type="button">Refresh</button>
+          </div>
+          <div id="transcripts-empty" class="empty" hidden>No transcripts yet.</div>
+          <div id="transcripts-list" class="list"></div>
+        </section>
+      </main>
+
+      <div id="toast" class="toast" hidden></div>
+    </div>
+    <script src="/assets/app.js" type="module"></script>
+  </body>
+</html>
