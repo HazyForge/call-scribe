@@ -950,7 +950,7 @@ VALUES
     }))
 }
 
-    #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn run_transcription_job(
     pool: &PgPool,
     provider: &SttProvider,
