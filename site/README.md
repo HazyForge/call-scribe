@@ -1,15 +1,12 @@
 # Call Scribe site
 
-Marketing site for [Call Scribe](https://github.com/HazyForge/call-scribe), served at
-**https://call-scribe.hazyforge.io**.
+Marketing site for Call Scribe — **https://call-scribe.hazyforge.io**.
 
-## Direction (Field Notes redesign)
+## Direction (Sheet A-101 blueprint)
 
-- Light paper editorial theme: masthead + thesis + annotated transcript plate + numbered folios +
-  repo preview + Codex handoff + install strip + colophon. Fraunces + Source Sans 3.
-- Hero video: overhead doc-camera "field recorder" film (gpt-image-1 still + Grok image-to-video),
-  shown inset as a photo plate — no full-bleed cinematic hero.
-- Palette: paper #F3EDE1, ink #17221F, moss #607C63, rust #B94E36, annotation yellow #E7C85A.
+Drafting-sheet world: sheet tabs (A-101/A-201/S-301), condensed sheet titles, plotter-video plate,
+speaker-trace elevation, decision/action/risk callouts, issued-documents schedule, revision-cloud install,
+title-block footer. Saira Condensed + Saira + Chivo Mono. Palette #163A7A / #E8F1FA / #FF5A36 / #F5C445.
 
 ## Local / container
 
