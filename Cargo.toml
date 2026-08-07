@@ -16,10 +16,12 @@ discord = ["dep:dashmap", "dep:hound", "dep:rustls", "dep:serenity", "dep:songbi
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
+axum = { version = "0.8", features = ["macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 dashmap = { version = "6.1", optional = true }
 hound = { version = "3.5", optional = true }
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
 mime_guess = "2.0"
 reqwest = { version = "0.13", features = ["json", "multipart"] }
 schemars = "1.0"
@@ -30,6 +32,8 @@ serenity = { version = "0.12", default-features = false, features = ["client", "
 songbird = { version = "0.6", default-features = false, features = ["driver", "gateway", "native", "serenity", "tungstenite", "receive"], optional = true }
 sqlx = { package = "sqlx-core", version = "0.8", default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "chrono", "json"] }
 sqlx-postgres = { version = "0.8", features = ["chrono", "json"] }
-tokio = { version = "1.47", features = ["fs", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.47", features = ["fs", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
 uuid = { version = "1.18", features = ["v4", "serde"] }
 walkdir = "2.5"
