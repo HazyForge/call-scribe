@@ -70,6 +70,19 @@ async function api(path, options = {}) {
     body: options.json ? JSON.stringify(options.json) : options.body,
   });
   const text = await res.text();
+  if (options.rawText) {
+    if (!res.ok) {
+      let msg = res.statusText || `HTTP ${res.status}`;
+      try {
+        const err = JSON.parse(text);
+        if (err?.error) msg = err.error;
+      } catch {
+        if (text) msg = text.slice(0, 200);
+      }
+      throw new Error(msg);
+    }
+    return text;
+  }
   let data = null;
   try {
     data = text ? JSON.parse(text) : null;
@@ -81,6 +94,44 @@ async function api(path, options = {}) {
     throw new Error(msg);
   }
   return data;
+}
+
+function openTranscriptModal({ title, subtitle, body }) {
+  const modal = document.getElementById("transcript-modal");
+  document.getElementById("transcript-modal-title").textContent = title || "Transcript";
+  document.getElementById("transcript-modal-sub").textContent = subtitle || "";
+  // textContent avoids HTML injection from transcript content
+  document.getElementById("transcript-modal-body").textContent = body || "";
+  modal.hidden = false;
+  document.body.style.overflow = "hidden";
+}
+
+function closeTranscriptModal() {
+  const modal = document.getElementById("transcript-modal");
+  modal.hidden = true;
+  document.getElementById("transcript-modal-body").textContent = "";
+  document.body.style.overflow = "";
+}
+
+async function viewTranscript(transcriptId) {
+  if (!state.token) {
+    toast("Sign in to view transcripts");
+    return;
+  }
+  toast("Loading transcript…");
+  try {
+    const body = await api(
+      `/v1/orgs/${encodeURIComponent(state.orgId)}/transcripts/${encodeURIComponent(transcriptId)}/content`,
+      { rawText: true },
+    );
+    openTranscriptModal({
+      title: `Transcript ${transcriptId.slice(0, 8)}…`,
+      subtitle: "Loaded over authenticated API — not a public URL.",
+      body,
+    });
+  } catch (err) {
+    toast(err.message || String(err));
+  }
 }
 
 function setSignedIn(signedIn) {
@@ -143,8 +194,9 @@ function renderTranscripts(items) {
     const node = document.createElement("article");
     node.className = "item";
     const completed = (item.status || "").toLowerCase() === "completed";
-    const open = item.delivery_uri
-      ? `<a class="btn ghost" href="/v1/orgs/${encodeURIComponent(state.orgId)}/transcripts/${encodeURIComponent(item.id)}/content" target="_blank" rel="noreferrer">Open</a>`
+    const canView = completed && !!item.delivery_uri;
+    const open = canView
+      ? `<button class="btn ghost" type="button" data-action="view-transcript" data-id="${escapeHtml(item.id)}">View</button>`
       : "";
     const issues = completed
       ? `<button class="btn primary" type="button" data-action="github-issues" data-id="${escapeHtml(item.id)}">GitHub issues</button>`
@@ -159,7 +211,6 @@ function renderTranscripts(items) {
           <span>${escapeHtml(formatWhen(item.created_at))}</span>
         </div>
         ${item.error ? `<div class="error">${escapeHtml(item.error)}</div>` : ""}
-        ${item.delivery_uri ? `<div class="item-meta">path: ${escapeHtml(item.delivery_uri)}</div>` : ""}
       </div>
       <div class="item-actions">${open}${issues}</div>
     `;
@@ -376,6 +427,16 @@ els.recordingsList.addEventListener("click", async (event) => {
 });
 
 els.transcriptsList.addEventListener("click", async (event) => {
+  const viewBtn = event.target.closest("[data-action='view-transcript']");
+  if (viewBtn) {
+    viewBtn.disabled = true;
+    try {
+      await viewTranscript(viewBtn.dataset.id);
+    } finally {
+      viewBtn.disabled = false;
+    }
+    return;
+  }
   const btn = event.target.closest("[data-action='github-issues']");
   if (!btn) return;
   btn.disabled = true;
@@ -384,6 +445,14 @@ els.transcriptsList.addEventListener("click", async (event) => {
   } finally {
     btn.disabled = false;
   }
+});
+
+document.getElementById("btn-close-modal").addEventListener("click", closeTranscriptModal);
+document.getElementById("transcript-modal").addEventListener("click", (event) => {
+  if (event.target?.dataset?.action === "close-modal") closeTranscriptModal();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeTranscriptModal();
 });
 
 document.getElementById("btn-github-connect").addEventListener("click", () => connectGitHub());
@@ -406,21 +475,20 @@ async function boot() {
     /* ignore */
   }
 
-  // Prefer saved token; otherwise try private-alpha server-side dev auth (no bearer).
-  if (state.token) {
-    els.tokenInput.value = state.token;
+  // Require an explicit bearer token. Private alpha: use subject "palehazy"
+  // when CALL_SCRIBE_DEV_AUTH_SUB is configured on the server.
+  if (!state.token) {
+    setSignedIn(false);
+    return;
   }
+  els.tokenInput.value = state.token;
   try {
     await loadMe();
     await Promise.all([loadRecordings(), loadTranscripts(), loadGitHub().catch(() => {})]);
   } catch (err) {
-    if (state.token) {
-      clearAuth();
-      els.authError.hidden = false;
-      els.authError.textContent = err.message || String(err);
-    } else {
-      setSignedIn(false);
-    }
+    clearAuth();
+    els.authError.hidden = false;
+    els.authError.textContent = err.message || String(err);
   }
 }
 
