@@ -16,6 +16,9 @@ const COMMANDS_PATH: &str = "internal/v1/worker/commands";
 const USAGE_RESERVATIONS_PATH: &str = "internal/v1/worker/usage/reservations";
 const WORKER_ID_HEADER: &str = "X-Call-Scribe-Worker-Id";
 pub(crate) const RESERVATION_EXPIRY_MARGIN: Duration = Duration::from_secs(15);
+pub(crate) const RESERVATION_MAX_LEASE: Duration = Duration::from_secs(90);
+pub(crate) const RESERVATION_SETTLEMENT_GRACE: Duration = Duration::from_secs(30 * 60);
+const RESERVATION_CLOCK_SKEW_TOLERANCE: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub(crate) struct HostedControlPlaneClient {
@@ -259,12 +262,41 @@ struct UsageRelease<'a> {
     lease_token: &'a str,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageHeartbeat<'a> {
+    lease_token: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageHeartbeatResponse {
+    reservation_id: String,
+    expires_at: String,
+}
+
 impl HostedControlPlaneClient {
     pub(crate) fn new(
         base_url: &str,
         workload_token: String,
         worker_id: String,
         outbox_encryption_secret: String,
+    ) -> Result<Self> {
+        Self::new_with_timeout(
+            base_url,
+            workload_token,
+            worker_id,
+            outbox_encryption_secret,
+            Duration::from_secs(10),
+        )
+    }
+
+    fn new_with_timeout(
+        base_url: &str,
+        workload_token: String,
+        worker_id: String,
+        outbox_encryption_secret: String,
+        request_timeout: Duration,
     ) -> Result<Self> {
         if workload_token.len() < 32 || workload_token.trim() != workload_token {
             bail!("hosted workload token must contain at least 32 bytes");
@@ -300,8 +332,11 @@ impl HostedControlPlaneClient {
             );
         }
         base_url.set_path("/");
+        if request_timeout.is_zero() {
+            bail!("hosted control-plane request timeout must be positive");
+        }
         let http = Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(request_timeout)
             .redirect(redirect::Policy::none())
             .build()
             .context("failed to build hosted control-plane HTTP client")?;
@@ -485,14 +520,9 @@ impl HostedControlPlaneClient {
             bail!("hosted usage reservation response was incomplete");
         }
         let expires_at = DateTime::parse_from_rfc3339(&reservation.expires_at)
-            .context("hosted usage reservation expiry was invalid")?;
-        if expires_at
-            <= Utc::now()
-                + chrono::Duration::from_std(RESERVATION_EXPIRY_MARGIN)
-                    .expect("reservation expiry margin must fit chrono duration")
-        {
-            bail!("hosted usage reservation expires too soon");
-        }
+            .context("hosted usage reservation expiry was invalid")?
+            .with_timezone(&Utc);
+        validate_reservation_expiry(expires_at, "reservation")?;
         Ok(reservation)
     }
 
@@ -527,6 +557,38 @@ impl HostedControlPlaneClient {
         Ok(())
     }
 
+    pub(crate) async fn heartbeat_usage(
+        &self,
+        reservation: &UsageReservation,
+    ) -> Result<DateTime<Utc>> {
+        let path = format!(
+            "{USAGE_RESERVATIONS_PATH}/{}/heartbeat",
+            urlencoding::encode(&reservation.reservation_id)
+        );
+        let response = self
+            .authenticated_request(Method::POST, self.base_url.join(&path)?)
+            .json(&UsageHeartbeat {
+                lease_token: &reservation.lease_token,
+            })
+            .send()
+            .await
+            .context("hosted usage heartbeat failed")?;
+        if response.status() != StatusCode::OK {
+            bail!("hosted usage heartbeat returned HTTP {}", response.status());
+        }
+        let heartbeat: UsageHeartbeatResponse = decode_json_bounded(response, 64 * 1024)
+            .await
+            .context("hosted usage heartbeat response was invalid")?;
+        if heartbeat.reservation_id != reservation.reservation_id {
+            bail!("hosted usage heartbeat returned a mismatched reservation id");
+        }
+        let expires_at = DateTime::parse_from_rfc3339(&heartbeat.expires_at)
+            .context("hosted usage heartbeat expiry was invalid")?
+            .with_timezone(&Utc);
+        validate_reservation_expiry(expires_at, "heartbeat")?;
+        Ok(expires_at)
+    }
+
     pub(crate) async fn release_usage(&self, reservation: &UsageReservation) -> Result<()> {
         let path = format!(
             "{USAGE_RESERVATIONS_PATH}/{}/release",
@@ -545,6 +607,23 @@ impl HostedControlPlaneClient {
         }
         Ok(())
     }
+}
+
+fn validate_reservation_expiry(expires_at: DateTime<Utc>, source: &str) -> Result<()> {
+    let now = Utc::now();
+    let minimum_expiry = now
+        + chrono::Duration::from_std(RESERVATION_EXPIRY_MARGIN)
+            .expect("reservation expiry margin must fit chrono duration");
+    if expires_at <= minimum_expiry {
+        bail!("hosted usage {source} expires too soon");
+    }
+    let maximum_expiry = now
+        + chrono::Duration::from_std(RESERVATION_MAX_LEASE + RESERVATION_CLOCK_SKEW_TOLERANCE)
+            .expect("reservation maximum lease must fit chrono duration");
+    if expires_at > maximum_expiry {
+        bail!("hosted usage {source} expiry exceeded the lease contract");
+    }
+    Ok(())
 }
 
 fn validate_command_result(result: &serde_json::Value) -> Result<()> {
@@ -684,6 +763,82 @@ fn storage_destination_supported(provider: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::Path;
+    use axum::http::HeaderMap;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::{Json, Router};
+
+    fn reservation(expires_at: DateTime<Utc>) -> UsageReservation {
+        UsageReservation {
+            reservation_id: "reservation-1".to_string(),
+            lease_token: "opaque-lease-token".to_string(),
+            reserved_seconds: 300,
+            expires_at: expires_at.to_rfc3339(),
+        }
+    }
+
+    fn test_client(base_url: &str, timeout: Duration) -> HostedControlPlaneClient {
+        HostedControlPlaneClient::new_with_timeout(
+            base_url,
+            "test-secret-with-at-least-thirty-two-bytes".to_string(),
+            "worker-1".to_string(),
+            "test-outbox-secret-with-at-least-thirty-two-bytes".to_string(),
+            timeout,
+        )
+        .expect("loopback hosted client should be valid")
+    }
+
+    async fn spawn_heartbeat_server(
+        status: StatusCode,
+        response_body: String,
+        delay: Duration,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should have an address");
+        let app = Router::new().route(
+            "/internal/v1/worker/usage/reservations/{reservation_id}/heartbeat",
+            post(
+                move |Path(reservation_id): Path<String>,
+                      headers: HeaderMap,
+                      Json(input): Json<serde_json::Value>| {
+                    let response_body = response_body.clone();
+                    async move {
+                        tokio::time::sleep(delay).await;
+                        if reservation_id != "reservation-1"
+                            || input != serde_json::json!({"leaseToken": "opaque-lease-token"})
+                            || headers
+                                .get(WORKER_ID_HEADER)
+                                .and_then(|value| value.to_str().ok())
+                                != Some("worker-1")
+                            || headers
+                                .get(reqwest::header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                != Some("Bearer test-secret-with-at-least-thirty-two-bytes")
+                        {
+                            return StatusCode::UNAUTHORIZED.into_response();
+                        }
+                        (
+                            status,
+                            [(reqwest::header::CONTENT_TYPE, "application/json")],
+                            response_body,
+                        )
+                            .into_response()
+                    }
+                },
+            ),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test heartbeat server should run");
+        });
+        format!("http://{address}")
+    }
 
     fn enabled_policy() -> GuildConfiguration {
         GuildConfiguration {
@@ -983,6 +1138,178 @@ mod tests {
                 "commandId": "cmd_01",
                 "requestedSeconds": 3_600
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_accepts_authoritative_renewal_and_shortening() {
+        let initial_expiry = Utc::now() + chrono::Duration::seconds(45);
+        let renewed_expiry = Utc::now() + chrono::Duration::seconds(80);
+        let server = spawn_heartbeat_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "reservationId": "reservation-1",
+                "expiresAt": renewed_expiry.to_rfc3339(),
+            })
+            .to_string(),
+            Duration::ZERO,
+        )
+        .await;
+        let renewed = test_client(&server, Duration::from_secs(1))
+            .heartbeat_usage(&reservation(initial_expiry))
+            .await
+            .expect("a valid renewal should be accepted");
+        assert_eq!(renewed, renewed_expiry);
+
+        let prior_expiry = Utc::now() + chrono::Duration::seconds(80);
+        let shortened_expiry = Utc::now() + chrono::Duration::seconds(45);
+        let server = spawn_heartbeat_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "reservationId": "reservation-1",
+                "expiresAt": shortened_expiry.to_rfc3339(),
+            })
+            .to_string(),
+            Duration::ZERO,
+        )
+        .await;
+        let shortened = test_client(&server, Duration::from_secs(1))
+            .heartbeat_usage(&reservation(prior_expiry))
+            .await
+            .expect("a still-safe authoritative shortening should be accepted");
+        assert_eq!(shortened, shortened_expiry);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_mismatch_malformed_and_near_expiry() {
+        let valid_reservation = reservation(Utc::now() + chrono::Duration::seconds(80));
+        let mismatch_server = spawn_heartbeat_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "reservationId": "reservation-2",
+                "expiresAt": (Utc::now() + chrono::Duration::seconds(80)).to_rfc3339(),
+            })
+            .to_string(),
+            Duration::ZERO,
+        )
+        .await;
+        assert!(
+            test_client(&mismatch_server, Duration::from_secs(1))
+                .heartbeat_usage(&valid_reservation)
+                .await
+                .is_err()
+        );
+
+        let malformed_server = spawn_heartbeat_server(
+            StatusCode::OK,
+            r#"{"reservationId":"reservation-1"}"#.to_string(),
+            Duration::ZERO,
+        )
+        .await;
+        assert!(
+            test_client(&malformed_server, Duration::from_secs(1))
+                .heartbeat_usage(&valid_reservation)
+                .await
+                .is_err()
+        );
+
+        let near_expiry_server = spawn_heartbeat_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "reservationId": "reservation-1",
+                "expiresAt": (Utc::now() + chrono::Duration::seconds(5)).to_rfc3339(),
+            })
+            .to_string(),
+            Duration::ZERO,
+        )
+        .await;
+        assert!(
+            test_client(&near_expiry_server, Duration::from_secs(1))
+                .heartbeat_usage(&valid_reservation)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_auth_revocation_timeout_and_outage() {
+        let valid_reservation = reservation(Utc::now() + chrono::Duration::seconds(80));
+        let auth_server = spawn_heartbeat_server(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"workload auth revoked"}"#.to_string(),
+            Duration::ZERO,
+        )
+        .await;
+        assert!(
+            test_client(&auth_server, Duration::from_secs(1))
+                .heartbeat_usage(&valid_reservation)
+                .await
+                .is_err()
+        );
+
+        let revoked_server = spawn_heartbeat_server(
+            StatusCode::CONFLICT,
+            r#"{"error":"reservation revoked"}"#.to_string(),
+            Duration::ZERO,
+        )
+        .await;
+        assert!(
+            test_client(&revoked_server, Duration::from_secs(1))
+                .heartbeat_usage(&valid_reservation)
+                .await
+                .is_err()
+        );
+
+        let slow_server = spawn_heartbeat_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "reservationId": "reservation-1",
+                "expiresAt": (Utc::now() + chrono::Duration::seconds(80)).to_rfc3339(),
+            })
+            .to_string(),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(
+            test_client(&slow_server, Duration::from_millis(20))
+                .heartbeat_usage(&valid_reservation)
+                .await
+                .is_err()
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("outage listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("outage listener should have an address");
+        drop(listener);
+        assert!(
+            test_client(&format!("http://{address}"), Duration::from_secs(1))
+                .heartbeat_usage(&valid_reservation)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_expiry_beyond_contract_horizon() {
+        let valid_reservation = reservation(Utc::now() + chrono::Duration::seconds(80));
+        let server = spawn_heartbeat_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "reservationId": "reservation-1",
+                "expiresAt": (Utc::now() + chrono::Duration::seconds(120)).to_rfc3339(),
+            })
+            .to_string(),
+            Duration::ZERO,
+        )
+        .await;
+        assert!(
+            test_client(&server, Duration::from_secs(1))
+                .heartbeat_usage(&valid_reservation)
+                .await
+                .is_err()
         );
     }
 

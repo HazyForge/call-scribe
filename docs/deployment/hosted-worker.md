@@ -134,50 +134,72 @@ the guild, generation, channel,
 and notice evidence from the leased command and atomically revalidates all
 gates. It returns an opaque reservation ID, lease
 token, bounded reserved seconds, and expiry. The worker stops no later than the
-reserved duration or fifteen seconds before lease expiry. A finalized recording
-is sent to `/reservations/<id>/consume` with its recording ID and actual
-duration; failed starts call `/reservations/<id>/release`. The server must use
-its own trusted time for billing periods, make recording IDs idempotent only
-for the same reservation, reject expired leases, and serialize reserve,
-consume, and release against one guild-level quota lock.
+reserved duration. It also posts `{"leaseToken":"..."}` to
+`/reservations/<id>/heartbeat` at least every ten seconds and requires an exact
+`{"reservationId":"...","expiresAt":"..."}` response. A heartbeat timeout,
+non-200 response, mismatched reservation, malformed timestamp, or expiry within
+the 15-second safety margin synchronously closes the WAV writer and stops the
+capture. Expiry beyond the 90-second contract (allowing five seconds for clock
+skew) is also rejected. A valid response may extend or shorten authority; the
+returned expiry replaces the worker's prior deadline and is persisted with
+crash-recovery ownership before the heartbeat succeeds locally. An independent
+one-second local watchdog enforces that stored deadline even if the shared
+heartbeat monitor exits unexpectedly.
+
+A finalized recording is sent to `/reservations/<id>/consume` with its
+recording ID and audio-derived actual duration; failed starts call
+`/reservations/<id>/release`. The server must use its own trusted time for
+billing periods, make recording IDs idempotent only for the same reservation,
+reject invalid settlement, and serialize heartbeat, reserve, consume, and
+release against one guild-level quota lock.
 The worker requests at most 3,600 seconds per reservation even when the guild
 has more monthly usage remaining.
 
-The server sets reservation expiry to the granted duration plus a bounded
-30-minute consume grace period; a fixed lease shorter than `reservedSeconds`
-is not a valid production contract. While a matching command/generation holds an
-active reservation, the worker may continue through only the snapshot's
-`usage_cap_exhausted` blocker and relies on the local duration/expiry fence. It
-still stops for stale configuration, entitlement or privacy revocation,
-consent/channel/storage changes, any other blocker, or a newer generation.
+The server grants a rolling capture authority no longer than 90 seconds and
+revalidates current entitlement, suspension, privacy, and canonical quota state
+on every heartbeat. When authority ends, the server keeps the reservation in a
+bounded stopping state for final settlement. The current contract allows 30
+minutes for that settlement; this grace permits only the exact final consume
+and never authorizes more recording. While a matching command/generation holds
+an active reservation, the worker may continue through only the snapshot's
+`usage_cap_exhausted` blocker and relies on the heartbeat plus local reserved
+duration fence. It still stops for stale configuration, entitlement or privacy
+revocation, consent/channel/storage changes, any other blocker, or a newer
+generation.
 
 Final usage is written before delivery to a durable outbox. The reservation
 lease token is encrypted with ChaCha20-Poly1305 under the dedicated stable key,
 with the reservation ID as associated data; plaintext lease tokens are not
 stored. The worker retries idempotent consumption every 30 seconds only inside
 `expiresAt`, then marks the entry terminal and emits an operator-reconciliation
-alert instead of retrying forever. Keep the outbox key available through the
-maximum reservation lifetime when rotating it.
+alert instead of retrying forever. `expiresAt` from the heartbeat is the capture
+deadline; the encrypted outbox derives its own deadline by adding only the
+30-minute settlement grace. Keep the outbox key available through that bounded
+settlement window when rotating it.
 
 Before joining Discord voice, the worker also persists an encrypted active
 reservation recovery row containing the recording ID and mixed-audio base WAV
-path. Each process uses a unique runtime owner ID and renews a database-visible
-heartbeat at least every ten seconds. Another replica can claim only an owner
-stale for at least 60 seconds, and every retry/delete is fenced by the current
-claim token. During startup, Discord join and each database/handler step are
-bounded and ownership is renewed once more before voice handlers are enabled.
-A heartbeat failure or ownership mismatch makes the old process synchronously
-close its hosted WAV writers before any Discord, network, or database cleanup,
-so a partitioned replica cannot keep recording past its ownership lease.
+path. Each process uses a unique runtime owner ID. At least every ten seconds it
+first renews control-plane authority, then atomically persists the returned
+expiry with its database-visible ownership heartbeat. Another replica can claim
+only an owner stale for at least 60 seconds, and every retry/delete is fenced by
+the current claim token. During startup, Discord join and each database/handler
+step are bounded; both control-plane authority and database ownership are
+renewed once more before voice handlers are enabled. Either heartbeat failure
+or an ownership mismatch makes the old process synchronously close its hosted
+WAV writers before any Discord, network, or database cleanup, so a partitioned
+replica cannot keep recording past valid authority.
 
 WAV headers are checkpointed every five seconds. After a process or pod crash,
 the next worker derives usage only from valid, contiguous mixed-audio WAV
 segment headers. It never derives billable duration from `startedAt` to the
 current wall clock. The recovered duration is rounded up to a whole second,
-clamped to `reservedSeconds`, and idempotently moved to the normal usage outbox;
-a zero-duration capture releases the reservation. Invalid or missing audio
-stays pending inside `expiresAt` and becomes a visible terminal
-operator-reconciliation item afterward.
+clamped to both `reservedSeconds` and the last persisted capture-authority
+window, and idempotently moved to the normal usage outbox; a zero-duration
+capture releases the reservation. Invalid or missing audio stays pending only
+inside the bounded settlement window and becomes a visible terminal
+operator-reconciliation item afterward. Recovery settles an abandoned capture;
+it never resumes capture or renews recording authority after a process crash.
 
 Recovery requires durable shared access to both Postgres and `captureDir`
 across pod replacement. A hard crash can discard audio written after the most
