@@ -20,6 +20,7 @@ const CONFIG_PATH: &str = "internal/v1/worker/guild-configurations";
 const COMMANDS_PATH: &str = "internal/v1/worker/commands";
 const USAGE_RESERVATIONS_PATH: &str = "internal/v1/worker/usage/reservations";
 const ARTIFACT_DELIVERY_PREPARE_PATH: &str = "internal/v1/worker/artifact-deliveries/prepare";
+const ARTIFACT_DELIVERY_ABANDON_PATH: &str = "internal/v1/worker/artifact-deliveries/abandon";
 const MAX_SIGNED_UPLOAD_URL_BYTES: usize = 16 * 1024;
 const MAX_SIGNED_UPLOAD_HEADERS: usize = 16;
 const MAX_UPLOAD_EXPIRY: Duration = Duration::from_secs(10 * 60);
@@ -404,6 +405,51 @@ pub(crate) struct ArtifactDeliveryReceipt {
     pub content_length: u64,
     pub sha256: String,
     pub verified_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ArtifactDeliveryAbandonRequest {
+    pub notification_id: String,
+    pub operation_id: Option<String>,
+    pub generation: Option<u64>,
+    pub reservation_id: String,
+    pub recording_id: String,
+    pub artifact_id: String,
+    pub artifact_kind: String,
+    pub segment_index: u32,
+    pub object_key: Option<String>,
+    pub destination_id: String,
+    pub destination_revision: String,
+    pub provider: String,
+    pub allowed_upload_host: String,
+    pub content_length: u64,
+    pub sha256: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ArtifactDeliveryAbandonResponse {
+    pub notification_id: String,
+    pub operation_id: Option<String>,
+    pub generation: Option<u64>,
+    pub reservation_id: String,
+    pub recording_id: String,
+    pub artifact_id: String,
+    pub artifact_kind: String,
+    pub segment_index: u32,
+    pub object_key: Option<String>,
+    pub destination_id: String,
+    pub destination_revision: String,
+    pub provider: String,
+    pub allowed_upload_host: String,
+    pub content_length: u64,
+    pub sha256: String,
+    pub reason: String,
+    pub accepted_at: DateTime<Utc>,
+    pub terminal_state: String,
+    pub cleanup_disposition: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -946,6 +992,117 @@ impl HostedControlPlaneClient {
             proof.receipt,
         )))
     }
+
+    pub(crate) async fn abandon_artifact_delivery(
+        &self,
+        request: &ArtifactDeliveryAbandonRequest,
+    ) -> Result<ArtifactDeliveryAbandonResponse> {
+        validate_artifact_abandon_request(request)?;
+        let response = self
+            .authenticated_request(
+                Method::POST,
+                self.base_url.join(ARTIFACT_DELIVERY_ABANDON_PATH)?,
+            )
+            .json(request)
+            .send()
+            .await
+            .context("hosted artifact abandonment notification failed")?;
+        if !response.status().is_success() {
+            bail!(
+                "hosted artifact abandonment notification returned HTTP {}",
+                response.status()
+            );
+        }
+        let response: ArtifactDeliveryAbandonResponse = decode_json_bounded(response, 32 * 1024)
+            .await
+            .context("hosted artifact abandonment response was invalid")?;
+        validate_artifact_abandon_response(&response, request)?;
+        Ok(response)
+    }
+}
+
+fn validate_artifact_abandon_request(request: &ArtifactDeliveryAbandonRequest) -> Result<()> {
+    let operation_scope_valid = match (
+        request.operation_id.as_deref(),
+        request.generation,
+        request.object_key.as_deref(),
+    ) {
+        (Some(operation_id), Some(generation), Some(object_key)) => {
+            valid_opaque_id(operation_id, 200) && generation > 0 && valid_object_key(object_key)
+        }
+        (None, None, None) => true,
+        _ => false,
+    };
+    if uuid::Uuid::parse_str(&request.notification_id)
+        .ok()
+        .is_none_or(|id| id.to_string() != request.notification_id)
+        || !operation_scope_valid
+        || !valid_opaque_id(&request.reservation_id, 200)
+        || !valid_opaque_id(&request.recording_id, 200)
+        || !valid_opaque_id(&request.artifact_id, 200)
+        || request.artifact_kind != "raw_audio_wav"
+        || !(1..=16).contains(&request.segment_index)
+        || !valid_opaque_id(&request.destination_id, 200)
+        || !valid_opaque_id(&request.destination_revision, 200)
+        || !storage_destination_supported(&request.provider)
+        || !valid_pinned_provider_host(&request.provider, &request.allowed_upload_host)
+        || request.content_length == 0
+        || decode_sha256_hex(&request.sha256).is_err()
+        || request.reason != "retry_budget_exhausted"
+    {
+        bail!("hosted artifact abandonment notification was invalid");
+    }
+    Ok(())
+}
+
+fn validate_artifact_abandon_response(
+    response: &ArtifactDeliveryAbandonResponse,
+    request: &ArtifactDeliveryAbandonRequest,
+) -> Result<()> {
+    let identity_matches = response.notification_id == request.notification_id
+        && response.operation_id == request.operation_id
+        && response.generation == request.generation
+        && response.reservation_id == request.reservation_id
+        && response.recording_id == request.recording_id
+        && response.artifact_id == request.artifact_id
+        && response.artifact_kind == request.artifact_kind
+        && response.segment_index == request.segment_index
+        && response.object_key == request.object_key
+        && response.destination_id == request.destination_id
+        && response.destination_revision == request.destination_revision
+        && response.provider == request.provider
+        && response.allowed_upload_host == request.allowed_upload_host
+        && response.content_length == request.content_length
+        && response.sha256 == request.sha256
+        && response.reason == request.reason;
+    let outcome_valid = match request.operation_id.as_ref() {
+        None => matches!(
+            (
+                response.terminal_state.as_str(),
+                response.cleanup_disposition.as_str(),
+            ),
+            ("cleanup_pending", "tombstone_queued")
+                | ("provider_absent", "no_operation")
+                | ("provider_absent", "not_required")
+                | ("provider_absent", "provider_absence_verified")
+        ),
+        Some(_) => matches!(
+            (
+                response.terminal_state.as_str(),
+                response.cleanup_disposition.as_str(),
+            ),
+            ("cleanup_pending", "tombstone_queued")
+                | ("provider_absent", "not_required")
+                | ("provider_absent", "provider_absence_verified")
+        ),
+    };
+    if !identity_matches
+        || !outcome_valid
+        || response.accepted_at > Utc::now() + chrono::Duration::minutes(1)
+    {
+        bail!("hosted artifact abandonment response did not bind the exact artifact");
+    }
+    Ok(())
 }
 
 fn validate_artifact_manifest_request(request: &ArtifactDeliveryPrepareRequest<'_>) -> Result<()> {
@@ -1656,6 +1813,27 @@ mod tests {
             content_length: 44,
             sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             content_type: "audio/wav",
+        }
+    }
+
+    fn artifact_abandonment_request() -> ArtifactDeliveryAbandonRequest {
+        ArtifactDeliveryAbandonRequest {
+            notification_id: "7754ab7e-c0f7-41a1-8373-9c213f27efb5".to_string(),
+            operation_id: Some("7f634aa5-f8cb-41b9-8c92-b23e5a44ae53".to_string()),
+            generation: Some(7),
+            reservation_id: "c5596189-da7b-4437-bd21-4541f877ee8a".to_string(),
+            recording_id: "rec_01".to_string(),
+            artifact_id: "art_01".to_string(),
+            artifact_kind: "raw_audio_wav".to_string(),
+            segment_index: 1,
+            object_key: Some("objects/art_01.wav".to_string()),
+            destination_id: "84b890cf-88d2-4979-b099-08978d2faedf".to_string(),
+            destination_revision: "c5b70242-8402-4120-a26d-122687ec9c06".to_string(),
+            provider: "customer_s3".to_string(),
+            allowed_upload_host: "bucket.s3.us-east-1.amazonaws.com".to_string(),
+            content_length: 44,
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            reason: "retry_budget_exhausted".to_string(),
         }
     }
 
@@ -2529,6 +2707,82 @@ mod tests {
         assert!(
             validate_delivery_receipt(&wrong_object, &operation, &request, &destination).is_err()
         );
+    }
+
+    #[test]
+    fn abandonment_contract_requires_complete_operation_identity_and_exact_echo() {
+        let request = artifact_abandonment_request();
+        assert!(validate_artifact_abandon_request(&request).is_ok());
+        let response = ArtifactDeliveryAbandonResponse {
+            notification_id: request.notification_id.clone(),
+            operation_id: request.operation_id.clone(),
+            generation: request.generation,
+            reservation_id: request.reservation_id.clone(),
+            recording_id: request.recording_id.clone(),
+            artifact_id: request.artifact_id.clone(),
+            artifact_kind: request.artifact_kind.clone(),
+            segment_index: request.segment_index,
+            object_key: request.object_key.clone(),
+            destination_id: request.destination_id.clone(),
+            destination_revision: request.destination_revision.clone(),
+            provider: request.provider.clone(),
+            allowed_upload_host: request.allowed_upload_host.clone(),
+            content_length: request.content_length,
+            sha256: request.sha256.clone(),
+            reason: request.reason.clone(),
+            accepted_at: Utc::now(),
+            terminal_state: "cleanup_pending".to_string(),
+            cleanup_disposition: "tombstone_queued".to_string(),
+        };
+        assert!(validate_artifact_abandon_response(&response, &request).is_ok());
+        let mut partial_scope = request.clone();
+        partial_scope.object_key = None;
+        assert!(validate_artifact_abandon_request(&partial_scope).is_err());
+
+        let mut mismatched = response.clone();
+        mismatched.artifact_id = "another-artifact".to_string();
+        assert!(validate_artifact_abandon_response(&mismatched, &request).is_err());
+
+        let mut unsafe_outcome = response;
+        unsafe_outcome.terminal_state = "provider_absent".to_string();
+        unsafe_outcome.cleanup_disposition = "tombstone_queued".to_string();
+        assert!(validate_artifact_abandon_response(&unsafe_outcome, &request).is_err());
+    }
+
+    #[test]
+    fn no_operation_abandonment_is_explicit_and_still_exactly_bound() {
+        let mut request = artifact_abandonment_request();
+        request.operation_id = None;
+        request.generation = None;
+        request.object_key = None;
+        assert!(validate_artifact_abandon_request(&request).is_ok());
+
+        let response = ArtifactDeliveryAbandonResponse {
+            notification_id: request.notification_id.clone(),
+            operation_id: None,
+            generation: None,
+            reservation_id: request.reservation_id.clone(),
+            recording_id: request.recording_id.clone(),
+            artifact_id: request.artifact_id.clone(),
+            artifact_kind: request.artifact_kind.clone(),
+            segment_index: request.segment_index,
+            object_key: None,
+            destination_id: request.destination_id.clone(),
+            destination_revision: request.destination_revision.clone(),
+            provider: request.provider.clone(),
+            allowed_upload_host: request.allowed_upload_host.clone(),
+            content_length: request.content_length,
+            sha256: request.sha256.clone(),
+            reason: request.reason.clone(),
+            accepted_at: Utc::now(),
+            terminal_state: "provider_absent".to_string(),
+            cleanup_disposition: "no_operation".to_string(),
+        };
+        assert!(validate_artifact_abandon_response(&response, &request).is_ok());
+        let mut response_loss_cleanup = response;
+        response_loss_cleanup.terminal_state = "cleanup_pending".to_string();
+        response_loss_cleanup.cleanup_disposition = "tombstone_queued".to_string();
+        assert!(validate_artifact_abandon_response(&response_loss_cleanup, &request).is_ok());
     }
 
     #[test]
