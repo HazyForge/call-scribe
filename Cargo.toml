@@ -35,7 +35,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"], opti
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "native_tls_backend"], optional = true }
 songbird = { version = "0.6", default-features = false, features = ["driver", "gateway", "native", "serenity", "tungstenite", "receive"], optional = true }
 sqlx = { package = "sqlx-core", version = "0.8", default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "chrono", "json"] }
-sqlx-postgres = { version = "0.8", features = ["chrono", "json"] }
+sqlx-postgres = { version = "0.8", features = ["chrono", "json", "uuid"] }
 tokio = { version = "1.47", features = ["fs", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.6", features = ["fs"] }

@@ -32,10 +32,10 @@ mod providers;
 
 #[cfg(feature = "discord")]
 use hosted_control::{
-    ArtifactDeliveryOperationRef, ArtifactDeliveryPrepareRequest, ArtifactDeliveryReceipt,
-    ArtifactDeliveryVerification, HostedConfigurationStore, HostedControlPlaneClient,
-    HostedStorageDestination, RESERVATION_EXPIRY_MARGIN, RESERVATION_SETTLEMENT_GRACE,
-    UsageReservation, WorkerCommand,
+    ArtifactDeliveryAbandonRequest, ArtifactDeliveryOperationRef, ArtifactDeliveryPrepareRequest,
+    ArtifactDeliveryReceipt, ArtifactDeliveryVerification, HostedConfigurationStore,
+    HostedControlPlaneClient, HostedStorageDestination, RESERVATION_EXPIRY_MARGIN,
+    RESERVATION_SETTLEMENT_GRACE, UsageReservation, WorkerCommand,
 };
 use providers::{
     ElevenLabsSttConfig, ElevenLabsSttProvider, OpenAiSttConfig, OpenAiSttProvider,
@@ -407,6 +407,7 @@ pub(crate) async fn migrate_runtime_schema(pool: &PgPool) -> Result<()> {
         include_str!("../migrations/20260812010000_hosted_worker_command_executions.sql"),
         include_str!("../migrations/20260812020000_hosted_capture_crash_recovery.sql"),
         include_str!("../migrations/20260812030000_hosted_artifact_delivery_outbox.sql"),
+        include_str!("../migrations/20260812040000_hosted_delivery_terminal_privacy.sql"),
     ] {
         sqlx::raw_sql::raw_sql(migration)
             .execute(pool)
@@ -611,6 +612,116 @@ struct HostedArtifactDeliveryRow {
     operation_id: Option<String>,
     operation_generation: Option<i64>,
     operation_object_key: Option<String>,
+}
+
+#[cfg(feature = "discord")]
+struct HostedArtifactAbandonmentRow {
+    artifact_id: String,
+    recording_id: String,
+    reservation_id: String,
+    segment_index: i32,
+    local_path: String,
+    content_length: i64,
+    sha256: String,
+    storage_provider: String,
+    storage_destination_id: String,
+    storage_destination_revision: String,
+    storage_allowed_host: String,
+    operation_id: Option<String>,
+    operation_generation: Option<i64>,
+    operation_object_key: Option<String>,
+    abandonment_notification_id: Uuid,
+}
+
+#[cfg(feature = "discord")]
+impl<'r> sqlx::from_row::FromRow<'r, sqlx_postgres::PgRow> for HostedArtifactAbandonmentRow {
+    fn from_row(row: &'r sqlx_postgres::PgRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            artifact_id: row.try_get("artifact_id")?,
+            recording_id: row.try_get("recording_id")?,
+            reservation_id: row.try_get("reservation_id")?,
+            segment_index: row.try_get("segment_index")?,
+            local_path: row.try_get("local_path")?,
+            content_length: row.try_get("content_length")?,
+            sha256: row.try_get("sha256")?,
+            storage_provider: row.try_get("storage_provider")?,
+            storage_destination_id: row.try_get("storage_destination_id")?,
+            storage_destination_revision: row.try_get("storage_destination_revision")?,
+            storage_allowed_host: row.try_get("storage_allowed_host")?,
+            operation_id: row.try_get("operation_id")?,
+            operation_generation: row.try_get("operation_generation")?,
+            operation_object_key: row.try_get("operation_object_key")?,
+            abandonment_notification_id: row.try_get("abandonment_notification_id")?,
+        })
+    }
+}
+
+#[cfg(feature = "discord")]
+struct HostedArtifactTerminalRow {
+    artifact_id: String,
+    organization_id: String,
+    guild_id: String,
+    recording_id: String,
+    reservation_id: String,
+    artifact_kind: String,
+    segment_index: i32,
+    content_length: i64,
+    sha256: String,
+    storage_provider: String,
+    storage_destination_id: String,
+    storage_destination_revision: String,
+    storage_allowed_host: String,
+    operation_id: Option<String>,
+    operation_object_key: Option<String>,
+    receipt: Option<serde_json::Value>,
+    attempt_count: i32,
+    abandonment_notification_id: Option<Uuid>,
+    abandonment_notification_attempt_count: i64,
+    completed_at: DateTime<Utc>,
+}
+
+#[cfg(feature = "discord")]
+impl<'r> sqlx::from_row::FromRow<'r, sqlx_postgres::PgRow> for HostedArtifactTerminalRow {
+    fn from_row(row: &'r sqlx_postgres::PgRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            artifact_id: row.try_get("artifact_id")?,
+            organization_id: row.try_get("organization_id")?,
+            guild_id: row.try_get("guild_id")?,
+            recording_id: row.try_get("recording_id")?,
+            reservation_id: row.try_get("reservation_id")?,
+            artifact_kind: row.try_get("artifact_kind")?,
+            segment_index: row.try_get("segment_index")?,
+            content_length: row.try_get("content_length")?,
+            sha256: row.try_get("sha256")?,
+            storage_provider: row.try_get("storage_provider")?,
+            storage_destination_id: row.try_get("storage_destination_id")?,
+            storage_destination_revision: row.try_get("storage_destination_revision")?,
+            storage_allowed_host: row.try_get("storage_allowed_host")?,
+            operation_id: row.try_get("operation_id")?,
+            operation_object_key: row.try_get("operation_object_key")?,
+            receipt: row.try_get("receipt")?,
+            attempt_count: row.try_get("attempt_count")?,
+            abandonment_notification_id: row.try_get("abandonment_notification_id")?,
+            abandonment_notification_attempt_count: row
+                .try_get("abandonment_notification_attempt_count")?,
+            completed_at: row.try_get("completed_at")?,
+        })
+    }
+}
+
+#[cfg(feature = "discord")]
+fn hash_hosted_terminal_field(label: &str, value: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"call-scribe-hosted-terminal-audit-v1\0");
+    digest.update(label.as_bytes());
+    digest.update(b"\0");
+    digest.update(value);
+    format!("{:x}", digest.finalize())
+}
+
+#[cfg(feature = "discord")]
+fn hash_hosted_terminal_text(label: &str, value: &str) -> String {
+    hash_hosted_terminal_field(label, value.as_bytes())
 }
 
 #[cfg(feature = "discord")]
@@ -2099,7 +2210,8 @@ SELECT EXISTS (
         sqlx::query::query(
             r#"
 UPDATE call_scribe_hosted_artifact_delivery_outbox
-SET status = 'failed', encrypted_lease_token = NULL, encryption_nonce = NULL,
+SET status = 'abandonment_pending', encrypted_lease_token = NULL, encryption_nonce = NULL,
+    abandonment_notification_id = COALESCE(abandonment_notification_id, gen_random_uuid()),
     claim_owner = NULL, claim_token = NULL, claim_until = NULL,
     last_error = 'hosted artifact delivery exhausted its retry budget', updated_at = now()
 WHERE status IN ('pending', 'in_progress')
@@ -2113,6 +2225,9 @@ WHERE status IN ('pending', 'in_progress')
         .context("failed to terminally fence exhausted hosted deliveries")?;
 
         self.finish_verified_hosted_artifact_deletions(capture_dir)
+            .await?;
+        self.archive_legacy_hosted_artifact_terminal_rows().await?;
+        self.notify_hosted_artifact_abandonments(client, capture_dir, claim_owner)
             .await?;
 
         let claim_token = Uuid::new_v4().to_string();
@@ -2170,6 +2285,177 @@ RETURNING delivery.artifact_id, delivery.recording_id, delivery.reservation_id,
         }
         self.finish_verified_hosted_artifact_deletions(capture_dir)
             .await
+    }
+
+    async fn notify_hosted_artifact_abandonments(
+        &self,
+        client: &HostedControlPlaneClient,
+        capture_dir: &Path,
+        claim_owner: &str,
+    ) -> Result<()> {
+        let claim_token = Uuid::new_v4().to_string();
+        let jobs: Vec<HostedArtifactAbandonmentRow> = sqlx::query_as::query_as(
+            r#"
+WITH candidates AS (
+    SELECT artifact_id
+    FROM call_scribe_hosted_artifact_delivery_outbox
+    WHERE (status IN ('abandonment_pending', 'cleanup_pending')
+           AND (claim_until IS NULL OR claim_until <= now()))
+      AND next_attempt_at <= now()
+    ORDER BY next_attempt_at, created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT 10
+)
+UPDATE call_scribe_hosted_artifact_delivery_outbox AS delivery
+SET claim_owner = $1, claim_token = $2, claim_until = now() + interval '1 minute',
+    abandonment_notification_attempt_count = abandonment_notification_attempt_count + 1,
+    updated_at = now()
+FROM candidates
+WHERE delivery.artifact_id = candidates.artifact_id
+RETURNING delivery.artifact_id, delivery.recording_id, delivery.reservation_id,
+          delivery.segment_index,
+          delivery.local_path, delivery.content_length, delivery.sha256,
+          delivery.storage_provider, delivery.storage_destination_id,
+          delivery.storage_destination_revision, delivery.storage_allowed_host,
+          delivery.operation_id, delivery.operation_generation,
+          delivery.operation_object_key, delivery.abandonment_notification_id
+"#,
+        )
+        .bind(claim_owner)
+        .bind(&claim_token)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to claim hosted artifact abandonment notifications")?;
+
+        for job in jobs {
+            let artifact_id = job.artifact_id.clone();
+            if let Err(error) = self
+                .notify_claimed_hosted_artifact_abandonment(client, capture_dir, &claim_token, job)
+                .await
+            {
+                eprintln!("hosted artifact {artifact_id} abandonment remains pending: {error:#}");
+                self.defer_claimed_hosted_artifact_abandonment(&artifact_id, &claim_token, &error)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn notify_claimed_hosted_artifact_abandonment(
+        &self,
+        client: &HostedControlPlaneClient,
+        capture_dir: &Path,
+        claim_token: &str,
+        job: HostedArtifactAbandonmentRow,
+    ) -> Result<()> {
+        let operation_generation = job
+            .operation_generation
+            .map(u64::try_from)
+            .transpose()
+            .context("hosted abandonment operation generation was invalid")?;
+        let segment_index = u32::try_from(job.segment_index)
+            .context("hosted abandonment segment index was invalid")?;
+        let content_length = u64::try_from(job.content_length)
+            .context("hosted abandonment content length was invalid")?;
+        let request = ArtifactDeliveryAbandonRequest {
+            notification_id: job.abandonment_notification_id.to_string(),
+            operation_id: job.operation_id.clone(),
+            generation: operation_generation,
+            reservation_id: job.reservation_id.clone(),
+            recording_id: job.recording_id.clone(),
+            artifact_id: job.artifact_id.clone(),
+            artifact_kind: "raw_audio_wav".to_string(),
+            segment_index,
+            object_key: job.operation_object_key.clone(),
+            destination_id: job.storage_destination_id.clone(),
+            destination_revision: job.storage_destination_revision.clone(),
+            provider: job.storage_provider.clone(),
+            allowed_upload_host: job.storage_allowed_host.clone(),
+            content_length,
+            sha256: job.sha256.clone(),
+            reason: "retry_budget_exhausted".to_string(),
+        };
+        let response = client.abandon_artifact_delivery(&request).await?;
+        if response.terminal_state == "cleanup_pending" {
+            let updated = sqlx::query::query(
+                r#"
+UPDATE call_scribe_hosted_artifact_delivery_outbox
+SET status = 'cleanup_pending', abandonment_notified_at = $3,
+    claim_owner = NULL, claim_token = NULL, claim_until = NULL,
+    next_attempt_at = now() + interval '30 seconds', last_error = NULL, updated_at = now()
+WHERE artifact_id = $1 AND status IN ('abandonment_pending', 'cleanup_pending')
+  AND claim_token = $2 AND abandonment_notification_id = $4
+"#,
+            )
+            .bind(&job.artifact_id)
+            .bind(claim_token)
+            .bind(response.accepted_at)
+            .bind(job.abandonment_notification_id)
+            .execute(&self.pool)
+            .await
+            .context("failed to persist pending provider cleanup acknowledgement")?;
+            if updated.rows_affected() != 1 {
+                bail!("hosted artifact abandonment claim fence was lost");
+            }
+            return Ok(());
+        }
+
+        let local_path = PathBuf::from(&job.local_path);
+        if !local_path.starts_with(capture_dir) {
+            bail!("hosted abandonment artifact escaped the configured capture directory");
+        }
+        match tokio::fs::remove_file(&local_path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("failed to remove abandoned hosted artifact"),
+        }
+        let updated = sqlx::query::query(
+            r#"
+UPDATE call_scribe_hosted_artifact_delivery_outbox
+SET status = 'abandoned', local_deleted_at = now(), completed_at = now(),
+    abandonment_notified_at = $3, claim_owner = NULL, claim_token = NULL,
+    claim_until = NULL, last_error = NULL, updated_at = now()
+WHERE artifact_id = $1 AND status IN ('abandonment_pending', 'cleanup_pending')
+  AND claim_token = $2 AND abandonment_notification_id = $4
+"#,
+        )
+        .bind(&job.artifact_id)
+        .bind(claim_token)
+        .bind(response.accepted_at)
+        .bind(job.abandonment_notification_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to persist authoritative hosted artifact abandonment")?;
+        if updated.rows_affected() != 1 {
+            bail!("hosted artifact abandonment claim fence was lost before completion");
+        }
+        self.archive_hosted_artifact_terminal_row(&job.artifact_id, "abandoned", Some(Utc::now()))
+            .await
+    }
+
+    async fn defer_claimed_hosted_artifact_abandonment(
+        &self,
+        artifact_id: &str,
+        claim_token: &str,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        let message: String = format!("{error:#}").chars().take(500).collect();
+        sqlx::query::query(
+            r#"
+UPDATE call_scribe_hosted_artifact_delivery_outbox
+SET claim_owner = NULL, claim_token = NULL, claim_until = NULL,
+    next_attempt_at = now() + interval '30 seconds', last_error = $3, updated_at = now()
+WHERE artifact_id = $1 AND status IN ('abandonment_pending', 'cleanup_pending')
+  AND claim_token = $2
+"#,
+        )
+        .bind(artifact_id)
+        .bind(claim_token)
+        .bind(message)
+        .execute(&self.pool)
+        .await
+        .context("failed to defer hosted artifact abandonment notification")?;
+        Ok(())
     }
 
     async fn deliver_claimed_hosted_artifact(
@@ -2391,7 +2677,7 @@ WHERE artifact_id = $1 AND status = 'in_progress' AND claim_token = $2
 WITH candidates AS (
     SELECT artifact_id
     FROM call_scribe_hosted_artifact_delivery_outbox
-    WHERE status = 'verified'
+    WHERE status = 'verified' AND (claim_until IS NULL OR claim_until <= now())
     ORDER BY verified_at
     FOR UPDATE SKIP LOCKED
     LIMIT 25
@@ -2431,7 +2717,7 @@ RETURNING delivery.artifact_id, delivery.local_path
                     continue;
                 }
             }
-            sqlx::query::query(
+            let completed = sqlx::query::query(
                 r#"
 UPDATE call_scribe_hosted_artifact_delivery_outbox
 SET status = 'delivered', local_deleted_at = now(), completed_at = now(),
@@ -2444,18 +2730,186 @@ WHERE artifact_id = $1 AND status = 'verified' AND claim_token = $2
             .execute(&self.pool)
             .await
             .context("failed to mark hosted artifact delivery complete")?;
-            sqlx::query::query(
-                r#"
-UPDATE call_scribe_artifacts
-SET metadata = metadata || '{"hosted_delivery_state":"delivered","local_deleted":true}'::jsonb
-WHERE id = $1
-"#,
-            )
-            .bind(&artifact_id)
-            .execute(&self.pool)
-            .await
-            .context("failed to update hosted artifact delivery metadata")?;
+            if completed.rows_affected() != 1 {
+                bail!("hosted artifact deletion claim fence was lost before completion");
+            }
+            self.archive_hosted_artifact_terminal_row(&artifact_id, "delivered", None)
+                .await?;
         }
+        Ok(())
+    }
+
+    async fn archive_legacy_hosted_artifact_terminal_rows(&self) -> Result<()> {
+        let rows: Vec<(String, String)> = sqlx::query_as::query_as(
+            r#"
+SELECT artifact_id, status
+FROM call_scribe_hosted_artifact_delivery_outbox
+WHERE status IN ('delivered', 'abandoned')
+ORDER BY completed_at, artifact_id
+LIMIT 25
+"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to select legacy hosted terminal delivery metadata")?;
+        for (artifact_id, terminal_state) in rows {
+            let provider_absence_verified_at = if terminal_state == "abandoned" {
+                Some(Utc::now())
+            } else {
+                None
+            };
+            self.archive_hosted_artifact_terminal_row(
+                &artifact_id,
+                &terminal_state,
+                provider_absence_verified_at,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn archive_hosted_artifact_terminal_row(
+        &self,
+        artifact_id: &str,
+        terminal_state: &str,
+        provider_absence_verified_at: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        if !matches!(terminal_state, "delivered" | "abandoned") {
+            bail!("hosted terminal archive state was invalid");
+        }
+        let mut tx = self.pool.begin().await?;
+        let Some(row) = sqlx::query_as::query_as::<_, HostedArtifactTerminalRow>(
+            r#"
+SELECT artifact_id, organization_id, guild_id, recording_id, reservation_id,
+       artifact_kind, segment_index, content_length, sha256, storage_provider,
+       storage_destination_id, storage_destination_revision, storage_allowed_host,
+       operation_id, operation_object_key, receipt, attempt_count,
+       abandonment_notification_id, abandonment_notification_attempt_count,
+       completed_at
+FROM call_scribe_hosted_artifact_delivery_outbox
+WHERE artifact_id = $1 AND status = $2
+FOR UPDATE
+"#,
+        )
+        .bind(artifact_id)
+        .bind(terminal_state)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            tx.rollback().await?;
+            return Ok(());
+        };
+        let receipt_sha256 = row
+            .receipt
+            .as_ref()
+            .map(serde_json::to_vec)
+            .transpose()
+            .context("failed to encode hosted delivery receipt for minimization")?
+            .map(|receipt| hash_hosted_terminal_field("receipt", &receipt));
+        sqlx::query::query(
+            r#"
+INSERT INTO call_scribe_hosted_artifact_delivery_terminal_audit
+    (id, notification_id, terminal_state, organization_id_sha256, guild_id_sha256,
+     recording_id_sha256, artifact_id_sha256, reservation_id_sha256,
+     operation_id_sha256, object_key_sha256, destination_id_sha256,
+     destination_revision_sha256, allowed_upload_host_sha256, provider,
+     artifact_kind, segment_index, content_length, content_sha256, receipt_sha256,
+     delivery_attempt_count, abandonment_notification_attempt_count,
+     provider_absence_verified_at, completed_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+        $15, $16, $17, $18, $19, $20, $21, $22, $23)
+ON CONFLICT (notification_id) WHERE notification_id IS NOT NULL DO NOTHING
+"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(row.abandonment_notification_id)
+        .bind(terminal_state)
+        .bind(hash_hosted_terminal_text(
+            "organization_id",
+            &row.organization_id,
+        ))
+        .bind(hash_hosted_terminal_text("guild_id", &row.guild_id))
+        .bind(hash_hosted_terminal_text("recording_id", &row.recording_id))
+        .bind(hash_hosted_terminal_text("artifact_id", &row.artifact_id))
+        .bind(hash_hosted_terminal_text(
+            "reservation_id",
+            &row.reservation_id,
+        ))
+        .bind(
+            row.operation_id
+                .as_deref()
+                .map(|value| hash_hosted_terminal_text("operation_id", value)),
+        )
+        .bind(
+            row.operation_object_key
+                .as_deref()
+                .map(|value| hash_hosted_terminal_text("object_key", value)),
+        )
+        .bind(hash_hosted_terminal_text(
+            "destination_id",
+            &row.storage_destination_id,
+        ))
+        .bind(hash_hosted_terminal_text(
+            "destination_revision",
+            &row.storage_destination_revision,
+        ))
+        .bind(hash_hosted_terminal_text(
+            "allowed_upload_host",
+            &row.storage_allowed_host,
+        ))
+        .bind(&row.storage_provider)
+        .bind(&row.artifact_kind)
+        .bind(row.segment_index)
+        .bind(row.content_length)
+        .bind(&row.sha256)
+        .bind(receipt_sha256)
+        .bind(row.attempt_count)
+        .bind(row.abandonment_notification_attempt_count)
+        .bind(provider_absence_verified_at)
+        .bind(row.completed_at)
+        .execute(&mut *tx)
+        .await
+        .context("failed to archive minimized hosted delivery evidence")?;
+
+        let minimized_metadata = serde_json::json!({
+            "terminal_state": terminal_state,
+            "artifact_id_sha256": hash_hosted_terminal_text("artifact_id", &row.artifact_id),
+            "recording_id_sha256": hash_hosted_terminal_text("recording_id", &row.recording_id),
+            "destination_id_sha256": hash_hosted_terminal_text(
+                "destination_id",
+                &row.storage_destination_id,
+            ),
+        });
+        sqlx::query::query(
+            r#"
+UPDATE call_scribe_audit_events
+SET organization_id = NULL, session_id = NULL, guild_id = NULL, channel_id = NULL,
+    metadata = $3
+WHERE session_id = $1
+  AND event_type = 'hosted_artifact_delivery_queued'
+  AND metadata ->> 'artifact_id' = $2
+"#,
+        )
+        .bind(&row.recording_id)
+        .bind(&row.artifact_id)
+        .bind(minimized_metadata)
+        .execute(&mut *tx)
+        .await
+        .context("failed to minimize hosted delivery audit metadata")?;
+        sqlx::query::query(
+            "DELETE FROM call_scribe_hosted_artifact_delivery_outbox WHERE artifact_id = $1 AND status = $2",
+        )
+        .bind(&row.artifact_id)
+        .bind(terminal_state)
+        .execute(&mut *tx)
+        .await
+        .context("failed to delete raw hosted terminal outbox metadata")?;
+        sqlx::query::query("DELETE FROM call_scribe_artifacts WHERE id = $1")
+            .bind(&row.artifact_id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to delete raw hosted terminal artifact metadata")?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -6508,6 +6962,97 @@ VALUES ('reservation-invalid', NULL, NULL, 'recording-invalid',
 
     #[cfg(feature = "discord")]
     #[tokio::test]
+    async fn terminal_privacy_migration_upgrades_failed_delivery_without_deleting_recovery_data()
+    -> Result<()> {
+        let Some((admin, pool, _second, schema)) = isolated_test_pools().await? else {
+            eprintln!("CALL_SCRIBE_TEST_DATABASE_URL is unset; skipping terminal migration proof");
+            return Ok(());
+        };
+        for migration in [
+            include_str!("../migrations/20260601183000_runtime_sessions_artifacts_audit.sql"),
+            include_str!("../migrations/20260601190000_drop_legacy_runtime_migrations.sql"),
+            include_str!("../migrations/20260803120000_multi_tenant_recordings_transcripts.sql"),
+            include_str!("../migrations/20260803140000_github_connections_and_issue_jobs.sql"),
+            include_str!("../migrations/20260803160000_browser_sessions.sql"),
+            include_str!("../migrations/20260812010000_hosted_worker_command_executions.sql"),
+            include_str!("../migrations/20260812020000_hosted_capture_crash_recovery.sql"),
+            include_str!("../migrations/20260812030000_hosted_artifact_delivery_outbox.sql"),
+        ] {
+            sqlx::raw_sql::raw_sql(migration).execute(&pool).await?;
+        }
+        sqlx::raw_sql::raw_sql(
+            r#"
+INSERT INTO call_scribe_capture_sessions
+    (id, source, title, status, started_at, organization_id, mode, metadata)
+VALUES ('recording-legacy-failed', 'discord', 'Legacy failed', 'completed', now(),
+        'org_private_alpha', 'record_only', '{}'::jsonb);
+INSERT INTO call_scribe_artifacts
+    (id, organization_id, session_id, kind, path, byte_size, metadata)
+VALUES ('artifact-legacy-failed', 'org_private_alpha', 'recording-legacy-failed',
+        'raw_audio_wav', '/captures/legacy-failed.wav', 44, '{}'::jsonb);
+INSERT INTO call_scribe_hosted_artifact_delivery_outbox
+    (artifact_id, organization_id, guild_id, recording_id, reservation_id,
+     artifact_kind, segment_index, local_path, content_length, sha256, content_type,
+     storage_provider, storage_destination_id, storage_destination_revision,
+     storage_allowed_host, storage_object_key_prefix, transient_delete_policy,
+     status, attempt_count)
+VALUES ('artifact-legacy-failed', 'org_private_alpha', '1',
+        'recording-legacy-failed', 'reservation-legacy-failed', 'raw_audio_wav', 1,
+        '/captures/legacy-failed.wav', 44,
+        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+        'audio/wav', 'customer_s3', 'destination-legacy', 'revision-legacy',
+        'bucket.s3.us-east-1.amazonaws.com', 'objects/',
+        'delete_after_verified_delivery', 'failed', 20)
+"#,
+        )
+        .execute(&pool)
+        .await?;
+
+        let migration =
+            include_str!("../migrations/20260812040000_hosted_delivery_terminal_privacy.sql");
+        sqlx::raw_sql::raw_sql(migration).execute(&pool).await?;
+        let first: (String, String, String, Option<DateTime<Utc>>) = sqlx::query_as::query_as(
+            r#"
+SELECT status, abandonment_notification_id::text, local_path, local_deleted_at
+FROM call_scribe_hosted_artifact_delivery_outbox
+WHERE artifact_id = 'artifact-legacy-failed'
+"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(first.0, "abandonment_pending");
+        assert_eq!(first.2, "/captures/legacy-failed.wav");
+        assert!(first.3.is_none());
+
+        sqlx::raw_sql::raw_sql(migration).execute(&pool).await?;
+        let replay: (String, String) = sqlx::query_as::query_as(
+            r#"
+SELECT status, abandonment_notification_id::text
+FROM call_scribe_hosted_artifact_delivery_outbox
+WHERE artifact_id = 'artifact-legacy-failed'
+"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(replay, (first.0, first.1));
+        assert!(
+            sqlx::query::query(
+                "UPDATE call_scribe_hosted_artifact_delivery_outbox SET status = 'abandoned' WHERE artifact_id = 'artifact-legacy-failed'",
+            )
+            .execute(&pool)
+            .await
+            .is_err(),
+            "migration must not permit terminal abandonment before local deletion"
+        );
+
+        pool.close().await;
+        drop_test_schema(&admin, &schema).await?;
+        admin.close().await;
+        Ok(())
+    }
+
+    #[cfg(feature = "discord")]
+    #[tokio::test]
     async fn two_instances_cannot_recover_a_live_heartbeating_capture() -> Result<()> {
         let Some((admin, first, second, schema)) = isolated_test_pools().await? else {
             eprintln!("CALL_SCRIBE_TEST_DATABASE_URL is unset; skipping Postgres replica proof");
@@ -6938,12 +7483,47 @@ WHERE recording_id = 'recording-delivery'
             .await?;
         assert_eq!(verify_calls.load(Ordering::SeqCst), 1);
         assert_eq!(unexpected_calls.load(Ordering::SeqCst), 0);
-        let delivered: String = sqlx::query_scalar::query_scalar(
-            "SELECT status FROM call_scribe_hosted_artifact_delivery_outbox WHERE recording_id = 'recording-delivery'",
+        let raw_rows: i64 = sqlx::query_scalar::query_scalar(
+            "SELECT count(*) FROM call_scribe_hosted_artifact_delivery_outbox WHERE recording_id = 'recording-delivery'",
         )
         .fetch_one(&first)
         .await?;
-        assert_eq!(delivered, "delivered");
+        assert_eq!(raw_rows, 0, "terminal raw locator metadata must be removed");
+        let delivered: (String, String, String, String, Option<String>) = sqlx::query_as::query_as(
+            r#"
+SELECT terminal_state, artifact_id_sha256, recording_id_sha256,
+       destination_id_sha256, receipt_sha256
+FROM call_scribe_hosted_artifact_delivery_terminal_audit
+WHERE artifact_id_sha256 = $1
+"#,
+        )
+        .bind(hash_hosted_terminal_text(
+            "artifact_id",
+            &manifests[0].artifact_id,
+        ))
+        .fetch_one(&first)
+        .await?;
+        assert_eq!(delivered.0, "delivered");
+        assert_eq!(
+            delivered.1,
+            hash_hosted_terminal_text("artifact_id", &manifests[0].artifact_id)
+        );
+        assert_eq!(
+            delivered.2,
+            hash_hosted_terminal_text("recording_id", "recording-delivery")
+        );
+        assert_eq!(
+            delivered.3,
+            hash_hosted_terminal_text("destination_id", &destination.destination_id)
+        );
+        assert!(delivered.4.is_some());
+        let raw_artifact_rows: i64 = sqlx::query_scalar::query_scalar(
+            "SELECT count(*) FROM call_scribe_artifacts WHERE id = $1",
+        )
+        .bind(&manifests[0].artifact_id)
+        .fetch_one(&first)
+        .await?;
+        assert_eq!(raw_artifact_rows, 0);
         assert!(
             !wav_path.exists(),
             "only the verified retry may delete local audio"
@@ -6953,6 +7533,263 @@ WHERE recording_id = 'recording-delivery'
         std::fs::remove_dir_all(&test_dir)?;
         first.close().await;
         second.close().await;
+        drop_test_schema(&admin, &schema).await?;
+        admin.close().await;
+        Ok(())
+    }
+
+    #[cfg(feature = "discord")]
+    #[tokio::test]
+    async fn exhausted_delivery_waits_for_provider_absence_then_minimizes_terminal_metadata()
+    -> Result<()> {
+        let Some((admin, pool, _second, schema)) = isolated_test_pools().await? else {
+            eprintln!("CALL_SCRIBE_TEST_DATABASE_URL is unset; skipping abandonment proof");
+            return Ok(());
+        };
+        migrate_runtime_schema(&pool).await?;
+        let store = SqlxRuntimeStore {
+            pool: pool.clone(),
+            organization_id: DEFAULT_ORGANIZATION_ID.to_string(),
+            capture_mode: CaptureMode::RecordOnly,
+        };
+        let test_dir = std::env::temp_dir().join(format!(
+            "call-scribe-abandonment-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&test_dir)?;
+        let wav_path = test_dir.join("exhausted.wav");
+        std::fs::write(&wav_path, b"recoverable-audio")?;
+        let artifact_id = format!("artifact-{}", Uuid::new_v4().simple());
+        let recording_id = format!("recording-{}", Uuid::new_v4().simple());
+        let reservation_id = Uuid::new_v4().to_string();
+        let destination_id = Uuid::new_v4().to_string();
+        let destination_revision = Uuid::new_v4().to_string();
+        let content_sha256 = hash_hosted_terminal_text("fixture-content", "recoverable-audio");
+        sqlx::query::query(
+            r#"
+INSERT INTO call_scribe_capture_sessions
+    (id, source, guild_id, channel_id, title, status, started_at, organization_id,
+     mode, metadata)
+VALUES ($1, 'discord', '1', '2', 'Abandonment proof', 'completed', now(),
+        'org_private_alpha', 'record_only', '{}'::jsonb)
+"#,
+        )
+        .bind(&recording_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query::query(
+            r#"
+INSERT INTO call_scribe_artifacts
+    (id, organization_id, session_id, kind, path, byte_size, metadata)
+VALUES ($1, 'org_private_alpha', $2, 'raw_audio_wav', $3, 17, $4)
+"#,
+        )
+        .bind(&artifact_id)
+        .bind(&recording_id)
+        .bind(wav_path.to_str().context("test path must be UTF-8")?)
+        .bind(json!({"artifact_id": artifact_id, "sha256": content_sha256}))
+        .execute(&pool)
+        .await?;
+        sqlx::query::query(
+            r#"
+INSERT INTO call_scribe_hosted_artifact_delivery_outbox
+    (artifact_id, organization_id, guild_id, recording_id, reservation_id,
+     encrypted_lease_token, encryption_nonce, artifact_kind, segment_index,
+     local_path, content_length, sha256, content_type, storage_provider,
+     storage_destination_id, storage_destination_revision, storage_allowed_host,
+     storage_object_key_prefix, transient_delete_policy, status, attempt_count,
+     next_attempt_at)
+VALUES ($1, 'org_private_alpha', '1', $2, $3, decode('00','hex'), decode('00','hex'),
+        'raw_audio_wav', 1, $4, 17, $5, 'audio/wav', 'customer_s3', $6, $7,
+        'bucket.s3.us-east-1.amazonaws.com', 'objects/',
+        'delete_after_verified_delivery', 'pending', $8, now())
+"#,
+        )
+        .bind(&artifact_id)
+        .bind(&recording_id)
+        .bind(&reservation_id)
+        .bind(wav_path.to_str().context("test path must be UTF-8")?)
+        .bind(&content_sha256)
+        .bind(&destination_id)
+        .bind(&destination_revision)
+        .bind(HOSTED_DELIVERY_MAX_ATTEMPTS)
+        .execute(&pool)
+        .await?;
+        sqlx::query::query(
+            r#"
+INSERT INTO call_scribe_audit_events
+    (id, organization_id, session_id, event_type, actor_kind, guild_id, metadata)
+VALUES ($1, 'org_private_alpha', $2, 'hosted_artifact_delivery_queued', 'system',
+        '1', $3)
+"#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&recording_id)
+        .bind(json!({
+            "artifact_id": artifact_id,
+            "recording_id": recording_id,
+            "object_key": "objects/exhausted.wav",
+            "allowed_upload_host": "bucket.s3.us-east-1.amazonaws.com",
+        }))
+        .execute(&pool)
+        .await?;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let calls = Arc::new(AtomicU64::new(0));
+        let notification_ids = Arc::new(Mutex::new(Vec::<String>::new()));
+        let handler_calls = calls.clone();
+        let handler_notifications = notification_ids.clone();
+        let app = axum::Router::new().route(
+            "/internal/v1/worker/artifact-deliveries/abandon",
+            axum::routing::post(
+                move |axum::Json(mut input): axum::Json<serde_json::Value>| {
+                    let handler_calls = handler_calls.clone();
+                    let handler_notifications = handler_notifications.clone();
+                    async move {
+                        let notification_id = input["notificationId"]
+                            .as_str()
+                            .expect("notification id must be present")
+                            .to_string();
+                        handler_notifications
+                            .lock()
+                            .expect("notification capture lock")
+                            .push(notification_id);
+                        assert!(input["operationId"].is_null());
+                        assert!(input["generation"].is_null());
+                        assert!(input["objectKey"].is_null());
+                        let call = handler_calls.fetch_add(1, Ordering::SeqCst);
+                        let object = input.as_object_mut().expect("request must be an object");
+                        object.insert("acceptedAt".into(), json!(Utc::now()));
+                        if call == 0 {
+                            object.insert("terminalState".into(), json!("cleanup_pending"));
+                            object.insert("cleanupDisposition".into(), json!("tombstone_queued"));
+                        } else {
+                            object.insert("terminalState".into(), json!("provider_absent"));
+                            object.insert(
+                                "cleanupDisposition".into(),
+                                json!("provider_absence_verified"),
+                            );
+                        }
+                        axum::Json(input)
+                    }
+                },
+            ),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let client = HostedControlPlaneClient::new(
+            &format!("http://{address}"),
+            "test-token-with-at-least-thirty-two-bytes".to_string(),
+            "abandonment-worker".to_string(),
+            "test-outbox-key-with-at-least-thirty-two-bytes".to_string(),
+        )?;
+
+        store
+            .retry_hosted_artifact_delivery_outbox(&client, &test_dir, "abandonment-worker")
+            .await?;
+        assert!(
+            wav_path.exists(),
+            "cleanup-pending must preserve local audio"
+        );
+        let pending: (String, String, Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as::query_as(
+            r#"
+SELECT status, abandonment_notification_id::text, encrypted_lease_token,
+       encryption_nonce
+FROM call_scribe_hosted_artifact_delivery_outbox WHERE artifact_id = $1
+"#,
+        )
+        .bind(&artifact_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(pending.0, "cleanup_pending");
+        assert!(pending.2.is_none() && pending.3.is_none());
+        assert!(
+            store
+                .has_unsafe_hosted_deliveries("org_private_alpha", "1", Duration::from_secs(0),)
+                .await?,
+            "provider cleanup must keep hosted capture backpressured"
+        );
+
+        sqlx::query::query(
+            "UPDATE call_scribe_hosted_artifact_delivery_outbox SET next_attempt_at = now() WHERE artifact_id = $1",
+        )
+        .bind(&artifact_id)
+        .execute(&pool)
+        .await?;
+        store
+            .retry_hosted_artifact_delivery_outbox(&client, &test_dir, "abandonment-worker")
+            .await?;
+        assert!(
+            !wav_path.exists(),
+            "provider-absence proof permits local purge"
+        );
+        assert_eq!(
+            sqlx::query_scalar::query_scalar::<_, i64>(
+                "SELECT count(*) FROM call_scribe_hosted_artifact_delivery_outbox WHERE artifact_id = $1",
+            )
+            .bind(&artifact_id)
+            .fetch_one(&pool)
+            .await?,
+            0
+        );
+        let audit: (String, String, Option<DateTime<Utc>>, Option<String>) =
+            sqlx::query_as::query_as(
+                r#"
+SELECT terminal_state, artifact_id_sha256, provider_absence_verified_at,
+       receipt_sha256
+FROM call_scribe_hosted_artifact_delivery_terminal_audit
+WHERE notification_id::text = $1
+"#,
+            )
+            .bind(&pending.1)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(audit.0, "abandoned");
+        assert_eq!(
+            audit.1,
+            hash_hosted_terminal_text("artifact_id", &artifact_id)
+        );
+        assert!(audit.2.is_some());
+        assert!(audit.3.is_none());
+        let minimized_event: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            serde_json::Value,
+        ) = sqlx::query_as::query_as(
+            r#"
+SELECT organization_id, session_id, guild_id, metadata
+FROM call_scribe_audit_events
+WHERE event_type = 'hosted_artifact_delivery_queued'
+  AND metadata ->> 'artifact_id_sha256' = $1
+"#,
+        )
+        .bind(hash_hosted_terminal_text("artifact_id", &artifact_id))
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            (minimized_event.0, minimized_event.1, minimized_event.2),
+            (None, None, None)
+        );
+        let event_text = minimized_event.3.to_string();
+        for sensitive in [
+            artifact_id.as_str(),
+            recording_id.as_str(),
+            "objects/exhausted.wav",
+            "bucket.s3.us-east-1.amazonaws.com",
+        ] {
+            assert!(!event_text.contains(sensitive));
+        }
+        let captured = notification_ids
+            .lock()
+            .expect("notification capture lock")
+            .clone();
+        assert_eq!(captured, vec![pending.1.clone(), pending.1]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+
+        std::fs::remove_dir_all(&test_dir)?;
+        pool.close().await;
         drop_test_schema(&admin, &schema).await?;
         admin.close().await;
         Ok(())

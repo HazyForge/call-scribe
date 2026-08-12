@@ -12,6 +12,20 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: call_scribe_test
+          POSTGRES_USER: call_scribe_test
+          POSTGRES_PASSWORD: call_scribe_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U call_scribe_test -d call_scribe_test"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -32,6 +46,8 @@ jobs:
         run: cargo clippy --all-features --all-targets --locked -- -D warnings
 
       - name: Run tests
+        env:
+          CALL_SCRIBE_TEST_DATABASE_URL: postgres://call_scribe_test:call_scribe_test@127.0.0.1:5432/call_scribe_test
         run: cargo test --all-features --locked
 
       - name: Audit dependencies

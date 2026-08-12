@@ -285,8 +285,53 @@ deletion. The provider `HEAD` must return the exact content length and
 the local WAV, and mark delivery final. It never stores either presigned URL or
 its headers. Failed uploads or verification retain the local WAV for fenced
 retry, and an unsafe delivery older than ten minutes backpressures later hosted
-starts for that organization/guild. After twenty attempts the job is terminal
-and still backpressures capture for operator reconciliation.
+starts for that organization/guild. After twenty attempts the worker clears the
+encrypted reservation lease and durably retries one idempotent abandonment
+notification:
+
+```json
+{
+  "notificationId": "7754ab7e-c0f7-41a1-8373-9c213f27efb5",
+  "operationId": "7f634aa5-f8cb-41b9-8c92-b23e5a44ae53",
+  "generation": 7,
+  "reservationId": "c5596189-da7b-4437-bd21-4541f877ee8a",
+  "recordingId": "recording_01",
+  "artifactId": "artifact_01",
+  "artifactKind": "raw_audio_wav",
+  "segmentIndex": 1,
+  "objectKey": "objects/artifact_01.wav",
+  "destinationId": "84b890cf-88d2-4979-b099-08978d2faedf",
+  "destinationRevision": "c5b70242-8402-4120-a26d-122687ec9c06",
+  "provider": "customer_s3",
+  "allowedUploadHost": "bucket.s3.us-east-1.amazonaws.com",
+  "contentLength": 123456,
+  "sha256": "64-lowercase-hex-characters",
+  "reason": "retry_budget_exhausted"
+}
+```
+
+The endpoint is
+`POST /internal/v1/worker/artifact-deliveries/abandon`. `notificationId` is
+generated once and reused for every retry. Operation ID, generation, and object
+key are either all present or all absent. A null operation tuple also covers a
+lost prepare response: the control plane resolves the exact historical
+reservation/artifact/destination tuple and never reveals the internally
+resolved operation in its echo. The control plane tuple-digest fences
+notification replay and exactly echoes every identity, destination, size, and
+hash field. A `cleanup_pending`/`tombstone_queued` response is only an
+acknowledgement: the worker retains the local WAV and raw locator metadata and
+continues backpressure while the customer-provider object may exist. Only a
+`provider_absent` response with `no_operation`, `not_required`, or
+`provider_absence_verified` authorizes local deletion and terminal metadata
+minimization. Thus neither service may race a delayed upload with a time-only
+deletion.
+
+After verified delivery/local purge or authoritative provider absence/local
+purge, the worker atomically replaces the raw terminal outbox, runtime artifact,
+receipt, provider host/key, filesystem path, and customer identifiers with
+domain-separated SHA-256 audit evidence. A bounded sweep processes 25 legacy
+terminal rows per worker pass. Self-hosted runtime artifacts and audit behavior
+are unchanged.
 
 ## Rollout
 

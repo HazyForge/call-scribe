@@ -122,6 +122,15 @@ Stores events such as:
 
 This table provides an append-only operational history for self-hosted deployments.
 
+Hosted raw-audio delivery uses a separate durable outbox while delivery or
+provider cleanup is active. Once verified delivery has removed the local file,
+or an idempotent control-plane abandonment handshake has authoritatively proved
+the provider object absent and the local file is removed, raw outbox, artifact,
+receipt, locator, and customer-identity fields are deleted. The hosted terminal
+audit table retains only domain-separated SHA-256 identity evidence, artifact
+shape, attempt counts, and completion timestamps. Cleanup-pending abandonment
+never deletes or minimizes the remaining local copy.
+
 ## Capture mode
 
 Set `CALL_SCRIBE_CAPTURE_MODE`:
