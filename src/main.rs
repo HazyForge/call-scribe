@@ -88,6 +88,12 @@ const DISCORD_WAV_SEGMENT_MAX_BYTES: u32 = STT_SEGMENT_MAX_INPUT_BYTES as u32;
 #[cfg(feature = "discord")]
 const DISCORD_TICK_SAMPLES: usize = (DISCORD_SAMPLE_RATE as usize / 50) * DISCORD_CHANNELS as usize;
 #[cfg(feature = "discord")]
+const MAX_HOSTED_RECOVERY_WAV_SEGMENTS: u32 = 16;
+#[cfg(feature = "discord")]
+const MIN_HOSTED_RECOVERY_STALE_AFTER: Duration = Duration::from_secs(60);
+#[cfg(feature = "discord")]
+const HOSTED_START_STEP_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(feature = "discord")]
 const DISCORD_PLAYOUT_BUFFER_PACKETS: u8 = 12;
 #[cfg(feature = "discord")]
 const DISCORD_PLAYOUT_SPIKE_PACKETS: u8 = 8;
@@ -383,6 +389,7 @@ pub(crate) async fn migrate_runtime_schema(pool: &PgPool) -> Result<()> {
         include_str!("../migrations/20260803140000_github_connections_and_issue_jobs.sql"),
         include_str!("../migrations/20260803160000_browser_sessions.sql"),
         include_str!("../migrations/20260812010000_hosted_worker_command_executions.sql"),
+        include_str!("../migrations/20260812020000_hosted_capture_crash_recovery.sql"),
     ] {
         sqlx::raw_sql::raw_sql(migration)
             .execute(pool)
@@ -497,8 +504,10 @@ struct HostedCaptureConfig {
 #[derive(Clone)]
 struct DiscordCaptureHandler {
     config: DiscordCaptureConfig,
+    recovery_owner_id: String,
     voice_states: Arc<DashMap<(GuildId, UserId), Option<ChannelId>>>,
     active: Arc<DashMap<GuildId, ActiveCapture>>,
+    finalizing_recording_ids: Arc<DashMap<String, ()>>,
     reconcile_gates: Arc<DashMap<GuildId, Arc<AsyncMutex<()>>>>,
     bot_user_id: Arc<Mutex<Option<UserId>>>,
     requested_channels: Arc<DashMap<GuildId, RequestedCapture>>,
@@ -532,6 +541,42 @@ type HostedUsageOutboxRow = (
 );
 
 #[cfg(feature = "discord")]
+type HostedCaptureRecoveryRow = (
+    String,
+    Vec<u8>,
+    Vec<u8>,
+    String,
+    String,
+    i64,
+    DateTime<Utc>,
+    DateTime<Utc>,
+);
+
+#[cfg(feature = "discord")]
+struct FinalizingRecordingGuard {
+    finalizing: Arc<DashMap<String, ()>>,
+    recording_id: String,
+}
+
+#[cfg(feature = "discord")]
+impl FinalizingRecordingGuard {
+    fn new(finalizing: Arc<DashMap<String, ()>>, recording_id: String) -> Self {
+        finalizing.insert(recording_id.clone(), ());
+        Self {
+            finalizing,
+            recording_id,
+        }
+    }
+}
+
+#[cfg(feature = "discord")]
+impl Drop for FinalizingRecordingGuard {
+    fn drop(&mut self) {
+        self.finalizing.remove(&self.recording_id);
+    }
+}
+
+#[cfg(feature = "discord")]
 #[derive(Debug, Eq, PartialEq)]
 enum CaptureTransition {
     Keep,
@@ -547,6 +592,7 @@ struct ActiveCapture {
     guild_id: GuildId,
     channel_id: ChannelId,
     started_at: DateTime<Local>,
+    base_wav_path: PathBuf,
     recorder: SharedWavRecorder,
     known_ssrcs: Arc<DashMap<u32, u64>>,
     voice_stats: Arc<DiscordVoiceStats>,
@@ -1048,6 +1094,344 @@ WHERE command_id = $1 AND status = 'started'
         Ok(())
     }
 
+    async fn persist_hosted_capture_recovery(
+        &self,
+        client: &HostedControlPlaneClient,
+        reservation: &UsageReservation,
+        recording_id: &str,
+        base_wav_path: &Path,
+        started_at: DateTime<Local>,
+        owner_instance_id: &str,
+    ) -> Result<()> {
+        let base_wav_path = base_wav_path
+            .to_str()
+            .context("hosted capture path was not valid UTF-8")?;
+        let reserved_seconds = i64::try_from(reservation.reserved_seconds)
+            .context("hosted reservation duration exceeded database range")?;
+        let started_at = started_at.with_timezone(&Utc);
+        let expires_at = DateTime::parse_from_rfc3339(&reservation.expires_at)
+            .context("hosted reservation expiry was invalid")?
+            .with_timezone(&Utc);
+        if expires_at <= started_at {
+            bail!("hosted reservation expired before capture recovery could be persisted");
+        }
+        let (encrypted_lease_token, encryption_nonce) = client
+            .encrypt_reservation_lease(&reservation.reservation_id, &reservation.lease_token)?;
+        sqlx::query::query(
+            r#"
+INSERT INTO call_scribe_hosted_capture_recovery
+    (reservation_id, encrypted_lease_token, encryption_nonce, recording_id,
+     base_wav_path, reserved_seconds, started_at, expires_at, owner_instance_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+"#,
+        )
+        .bind(&reservation.reservation_id)
+        .bind(encrypted_lease_token)
+        .bind(encryption_nonce)
+        .bind(recording_id)
+        .bind(base_wav_path)
+        .bind(reserved_seconds)
+        .bind(started_at)
+        .bind(expires_at)
+        .bind(owner_instance_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to persist hosted capture recovery state")?;
+        Ok(())
+    }
+
+    async fn remove_live_hosted_capture_recovery(
+        &self,
+        reservation_id: &str,
+        recording_id: &str,
+        owner_instance_id: &str,
+    ) -> Result<()> {
+        let deleted = sqlx::query::query(
+            r#"
+DELETE FROM call_scribe_hosted_capture_recovery
+WHERE reservation_id = $1
+  AND recording_id = $2
+  AND owner_instance_id = $3
+  AND status = 'active'
+"#,
+        )
+        .bind(reservation_id)
+        .bind(recording_id)
+        .bind(owner_instance_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to clear hosted capture recovery state")?;
+        if deleted.rows_affected() != 1 {
+            bail!("live hosted capture recovery ownership was lost");
+        }
+        Ok(())
+    }
+
+    async fn claim_live_hosted_capture_finalization(
+        &self,
+        reservation_id: &str,
+        recording_id: &str,
+        owner_instance_id: &str,
+    ) -> Result<String> {
+        let recovery_claim_token = Uuid::new_v4().to_string();
+        let claimed = sqlx::query::query(
+            r#"
+UPDATE call_scribe_hosted_capture_recovery
+SET status = 'reconciling',
+    recovery_claim_token = $4,
+    recovery_lease_until = now() + interval '60 seconds',
+    updated_at = now()
+WHERE reservation_id = $1
+  AND recording_id = $2
+  AND owner_instance_id = $3
+  AND status = 'active'
+"#,
+        )
+        .bind(reservation_id)
+        .bind(recording_id)
+        .bind(owner_instance_id)
+        .bind(&recovery_claim_token)
+        .execute(&self.pool)
+        .await
+        .context("failed to fence live hosted capture finalization")?;
+        if claimed.rows_affected() != 1 {
+            bail!("live hosted capture recovery ownership was lost before finalization");
+        }
+        Ok(recovery_claim_token)
+    }
+
+    async fn remove_claimed_hosted_capture_recovery(
+        &self,
+        reservation_id: &str,
+        recording_id: &str,
+        recovery_claim_token: &str,
+    ) -> Result<()> {
+        let deleted = sqlx::query::query(
+            r#"
+DELETE FROM call_scribe_hosted_capture_recovery
+WHERE reservation_id = $1
+  AND recording_id = $2
+  AND status = 'reconciling'
+  AND recovery_claim_token = $3
+"#,
+        )
+        .bind(reservation_id)
+        .bind(recording_id)
+        .bind(recovery_claim_token)
+        .execute(&self.pool)
+        .await
+        .context("failed to clear claimed hosted capture recovery state")?;
+        if deleted.rows_affected() != 1 {
+            bail!("hosted capture recovery claim fence was lost");
+        }
+        Ok(())
+    }
+
+    async fn heartbeat_hosted_capture_recoveries(
+        &self,
+        owner_instance_id: &str,
+        active_recording_ids: &std::collections::HashSet<String>,
+    ) -> Result<std::collections::HashSet<String>> {
+        if active_recording_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let recording_ids: Vec<_> = active_recording_ids.iter().cloned().collect();
+        let heartbeated: Vec<String> = sqlx::query_scalar::query_scalar(
+            r#"
+UPDATE call_scribe_hosted_capture_recovery
+SET heartbeat_at = now(), updated_at = now()
+WHERE owner_instance_id = $1
+  AND status = 'active'
+  AND recording_id = ANY($2::text[])
+RETURNING recording_id
+"#,
+        )
+        .bind(owner_instance_id)
+        .bind(recording_ids)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to heartbeat live hosted capture recovery state")?;
+        Ok(heartbeated.into_iter().collect())
+    }
+
+    async fn defer_hosted_capture_recovery(
+        &self,
+        reservation_id: &str,
+        recovery_claim_token: &str,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        let message: String = format!("{error:#}").chars().take(500).collect();
+        let deferred = sqlx::query::query(
+            r#"
+UPDATE call_scribe_hosted_capture_recovery
+SET status = 'active',
+    next_attempt_at = LEAST(expires_at - interval '5 seconds', now() + interval '30 seconds'),
+    recovery_lease_until = NULL,
+    recovery_claim_token = NULL,
+    last_error = $3,
+    updated_at = now()
+WHERE reservation_id = $1
+  AND status = 'reconciling'
+  AND recovery_claim_token = $2
+"#,
+        )
+        .bind(reservation_id)
+        .bind(recovery_claim_token)
+        .bind(message)
+        .execute(&self.pool)
+        .await
+        .context("failed to defer hosted capture recovery")?;
+        if deferred.rows_affected() != 1 {
+            bail!("hosted capture recovery claim fence was lost before retry");
+        }
+        Ok(())
+    }
+
+    async fn claim_abandoned_hosted_capture_recoveries(
+        &self,
+        stale_after: Duration,
+        recovery_claim_token: &str,
+    ) -> Result<Vec<HostedCaptureRecoveryRow>> {
+        let stale_after = chrono::Duration::from_std(stale_after)
+            .context("hosted recovery stale threshold exceeded timestamp range")?;
+        let stale_before = Utc::now() - stale_after;
+        sqlx::query_as::query_as(
+            r#"
+WITH candidates AS (
+    SELECT reservation_id
+    FROM call_scribe_hosted_capture_recovery
+    WHERE ((status = 'active' AND heartbeat_at <= $1)
+           OR (status = 'reconciling' AND recovery_lease_until <= now()))
+      AND next_attempt_at <= now()
+      AND expires_at > now() + interval '5 seconds'
+      AND encrypted_lease_token IS NOT NULL
+      AND encryption_nonce IS NOT NULL
+    ORDER BY next_attempt_at, created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT 25
+)
+UPDATE call_scribe_hosted_capture_recovery AS recovery
+SET status = 'reconciling',
+    recovery_claim_token = $2,
+    attempt_count = attempt_count + 1,
+    recovery_lease_until = now() + interval '60 seconds',
+    updated_at = now()
+FROM candidates
+WHERE recovery.reservation_id = candidates.reservation_id
+RETURNING recovery.reservation_id, recovery.encrypted_lease_token,
+          recovery.encryption_nonce, recovery.recording_id,
+          recovery.base_wav_path, recovery.reserved_seconds,
+          recovery.started_at, recovery.expires_at
+"#,
+        )
+        .bind(stale_before)
+        .bind(recovery_claim_token)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to claim hosted capture recovery")
+    }
+
+    async fn retry_hosted_capture_recovery(
+        &self,
+        client: &HostedControlPlaneClient,
+        capture_dir: &Path,
+        stale_after: Duration,
+    ) -> Result<()> {
+        let expired: Vec<(String, String)> = sqlx::query_as::query_as(
+            r#"
+UPDATE call_scribe_hosted_capture_recovery
+SET status = 'expired',
+    encrypted_lease_token = NULL,
+    encryption_nonce = NULL,
+    recovery_lease_until = NULL,
+    recovery_claim_token = NULL,
+    last_error = 'reservation expired before crash recovery completed',
+    updated_at = now()
+WHERE (status = 'active'
+       OR (status = 'reconciling' AND recovery_lease_until <= now()))
+  AND expires_at <= now() + interval '5 seconds'
+RETURNING reservation_id, recording_id
+"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to expire hosted capture recovery")?;
+        for (reservation_id, recording_id) in expired {
+            eprintln!(
+                "hosted capture {recording_id} reservation {reservation_id} expired before audio-derived recovery; operator reconciliation is required"
+            );
+        }
+
+        let recovery_claim_token = Uuid::new_v4().to_string();
+        let recoveries = self
+            .claim_abandoned_hosted_capture_recoveries(stale_after, &recovery_claim_token)
+            .await?;
+
+        for (
+            reservation_id,
+            encrypted_lease_token,
+            encryption_nonce,
+            recording_id,
+            base_wav_path,
+            reserved_seconds,
+            started_at,
+            expires_at,
+        ) in recoveries
+        {
+            let recovery_result = async {
+                let base_wav_path = PathBuf::from(base_wav_path);
+                if !base_wav_path.starts_with(capture_dir) {
+                    bail!("hosted recovery WAV escaped the configured capture directory");
+                }
+                let lease_token = client.decrypt_reservation_lease(
+                    &reservation_id,
+                    &encrypted_lease_token,
+                    &encryption_nonce,
+                )?;
+                let reserved_seconds = u64::try_from(reserved_seconds)
+                    .context("hosted recovery reservation duration was invalid")?;
+                let reservation = UsageReservation {
+                    reservation_id: reservation_id.clone(),
+                    lease_token,
+                    reserved_seconds,
+                    expires_at: expires_at.to_rfc3339(),
+                };
+                let actual_seconds = recovered_usage_seconds(&base_wav_path, reserved_seconds)?;
+                if actual_seconds == 0 {
+                    client.release_usage(&reservation).await?;
+                } else {
+                    let occurred_at = started_at
+                        + chrono::Duration::seconds(
+                            i64::try_from(actual_seconds)
+                                .context("hosted recovery duration exceeded timestamp range")?,
+                        );
+                    self.enqueue_hosted_usage(
+                        client,
+                        &reservation,
+                        &recording_id,
+                        actual_seconds,
+                        occurred_at,
+                    )
+                    .await?;
+                }
+                self.remove_claimed_hosted_capture_recovery(
+                    &reservation_id,
+                    &recording_id,
+                    &recovery_claim_token,
+                )
+                .await
+            }
+            .await;
+
+            if let Err(err) = recovery_result {
+                eprintln!("hosted capture {recording_id} recovery remains pending: {err:#}");
+                self.defer_hosted_capture_recovery(&reservation_id, &recovery_claim_token, &err)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn enqueue_hosted_usage(
         &self,
         client: &HostedControlPlaneClient,
@@ -1118,6 +1502,8 @@ WHERE reservation_id = $1
             r#"
 UPDATE call_scribe_hosted_usage_outbox
 SET status = 'expired',
+    encrypted_lease_token = NULL,
+    encryption_nonce = NULL,
     last_error = 'reservation expired before usage delivery',
     updated_at = now()
 WHERE status = 'pending' AND expires_at <= now() + interval '5 seconds'
@@ -1141,6 +1527,8 @@ FROM call_scribe_hosted_usage_outbox
 WHERE status = 'pending'
   AND next_attempt_at <= now()
   AND expires_at > now() + interval '5 seconds'
+  AND encrypted_lease_token IS NOT NULL
+  AND encryption_nonce IS NOT NULL
 ORDER BY next_attempt_at, created_at
 LIMIT 25
 "#,
@@ -1170,7 +1558,11 @@ LIMIT 25
                     sqlx::query::query(
                         r#"
 UPDATE call_scribe_hosted_usage_outbox
-SET status = 'expired', last_error = $2, updated_at = now()
+SET status = 'expired',
+    encrypted_lease_token = NULL,
+    encryption_nonce = NULL,
+    last_error = $2,
+    updated_at = now()
 WHERE reservation_id = $1 AND status = 'pending'
 "#,
                     )
@@ -1207,6 +1599,7 @@ WHERE reservation_id = $1 AND status = 'pending'
                         r#"
 UPDATE call_scribe_hosted_usage_outbox
 SET status = 'delivered', attempt_count = attempt_count + 1,
+    encrypted_lease_token = NULL, encryption_nonce = NULL,
     last_error = NULL, delivered_at = now(), updated_at = now()
 WHERE reservation_id = $1 AND status = 'pending'
 "#,
@@ -1835,8 +2228,10 @@ impl DiscordCaptureHandler {
     fn new(config: DiscordCaptureConfig) -> Self {
         Self {
             config,
+            recovery_owner_id: Uuid::new_v4().to_string(),
             voice_states: Arc::new(DashMap::new()),
             active: Arc::new(DashMap::new()),
+            finalizing_recording_ids: Arc::new(DashMap::new()),
             reconcile_gates: Arc::new(DashMap::new()),
             bot_user_id: Arc::new(Mutex::new(None)),
             requested_channels: Arc::new(DashMap::new()),
@@ -2006,6 +2401,41 @@ impl DiscordCaptureHandler {
             .clone()
     }
 
+    async fn abort_starting_capture(
+        &self,
+        manager: &Arc<Songbird>,
+        guild_id: GuildId,
+        recorder: &SharedWavRecorder,
+        runtime_store: Option<&SqlxRuntimeStore>,
+        hosted_usage: Option<&(HostedControlPlaneClient, UsageReservation)>,
+        recover_owned_reservation: bool,
+    ) {
+        // No hosted failure cleanup may wait on Discord or the database while
+        // its writer remains enabled. Closing the WAV is the side-effect fence.
+        if let Err(err) = finalize_wav(recorder) {
+            eprintln!("failed to checkpoint aborted Discord capture: {err:#}");
+        }
+        if manager.get(guild_id).is_some()
+            && tokio::time::timeout(DISCORD_VOICE_TRANSITION_TIMEOUT, manager.remove(guild_id))
+                .await
+                .is_err()
+        {
+            eprintln!(
+                "timed out leaving Discord after aborting capture in guild {}",
+                guild_id.get()
+            );
+        }
+        if recover_owned_reservation
+            && let Some((client, _)) = hosted_usage
+            && let Some(store) = runtime_store
+            && let Err(err) = store
+                .retry_hosted_capture_recovery(client, &self.config.capture_dir, Duration::ZERO)
+                .await
+        {
+            eprintln!("hosted usage recovery remains pending after aborted start: {err:#}");
+        }
+    }
+
     async fn start_capture(
         &self,
         ctx: &SerenityContext,
@@ -2102,6 +2532,36 @@ impl DiscordCaptureHandler {
             None => None,
         };
 
+        if let Some((client, reservation)) = &hosted_usage {
+            let store = runtime_store
+                .as_ref()
+                .context("hosted capture omitted its durable runtime store")?;
+            if let Err(err) = store
+                .persist_hosted_capture_recovery(
+                    client,
+                    reservation,
+                    &session_id,
+                    &base_wav_path,
+                    started_at,
+                    &self.recovery_owner_id,
+                )
+                .await
+            {
+                if client.release_usage(reservation).await.is_ok() {
+                    let _ = store
+                        .remove_live_hosted_capture_recovery(
+                            &reservation.reservation_id,
+                            &session_id,
+                            &self.recovery_owner_id,
+                        )
+                        .await;
+                }
+                return Err(err).context(
+                    "hosted reservation was not durably recoverable before joining voice",
+                );
+            }
+        }
+
         let join_result = tokio::time::timeout(
             DISCORD_VOICE_TRANSITION_TIMEOUT,
             manager.join(guild_id, channel_id),
@@ -2113,53 +2573,125 @@ impl DiscordCaptureHandler {
             Err(_) => Some("timed out joining Discord voice channel".to_string()),
         };
         if let Some(join_error) = join_error {
-            if let Some((client, reservation)) = &hosted_usage
-                && let Err(release_err) = client.release_usage(reservation).await
-            {
-                eprintln!(
-                    "failed to release hosted usage after voice join failure: {release_err:#}"
-                );
+            if let Some((client, reservation)) = &hosted_usage {
+                match client.release_usage(reservation).await {
+                    Ok(()) => {
+                        if let Some(store) = &runtime_store
+                            && let Err(clear_err) = store
+                                .remove_live_hosted_capture_recovery(
+                                    &reservation.reservation_id,
+                                    &session_id,
+                                    &self.recovery_owner_id,
+                                )
+                                .await
+                        {
+                            eprintln!(
+                                "failed to clear released hosted capture recovery: {clear_err:#}"
+                            );
+                        }
+                    }
+                    Err(release_err) => {
+                        eprintln!(
+                            "failed to release hosted usage after voice join failure; recovery remains pending: {release_err:#}"
+                        );
+                    }
+                }
             }
             bail!(join_error);
         }
 
-        {
-            let handler_lock = manager.get_or_insert(guild_id);
-            let mut handler = handler_lock.lock().await;
-            handler.add_global_event(CoreEvent::SpeakingStateUpdate.into(), receiver.clone());
-            handler.add_global_event(CoreEvent::ClientDisconnect.into(), receiver.clone());
-            handler.add_global_event(CoreEvent::VoiceTick.into(), receiver);
-        }
-
-        if let Some(store) = &runtime_store
-            && let Err(err) = store
-                .record_session_started(
-                    &session_id,
-                    guild_id,
-                    channel_id,
-                    started_at,
-                    &title,
-                    serde_json::json!({
-                        "base_wav_path": base_wav_path.display().to_string(),
-                        "capture_dir": self.config.capture_dir.display().to_string(),
-                        "hosted_generation": hosted_generation,
-                        "usage_reservation_id": hosted_usage
-                            .as_ref()
-                            .map(|(_, reservation)| &reservation.reservation_id),
-                    }),
-                )
-                .await
-        {
-            let _ = manager.remove(guild_id).await;
-            if let Some((client, reservation)) = &hosted_usage
-                && let Err(release_err) = client.release_usage(reservation).await
-            {
-                eprintln!(
-                    "failed to release hosted usage after persistence failure: {release_err:#}"
-                );
+        let session_metadata = serde_json::json!({
+            "base_wav_path": base_wav_path.display().to_string(),
+            "capture_dir": self.config.capture_dir.display().to_string(),
+            "hosted_generation": hosted_generation,
+            "usage_reservation_id": hosted_usage
+                .as_ref()
+                .map(|(_, reservation)| &reservation.reservation_id),
+        });
+        let session_start_result = if let Some(store) = &runtime_store {
+            let persist = store.record_session_started(
+                &session_id,
+                guild_id,
+                channel_id,
+                started_at,
+                &title,
+                session_metadata,
+            );
+            if hosted_usage.is_some() {
+                match tokio::time::timeout(HOSTED_START_STEP_TIMEOUT, persist).await {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "timed out persisting hosted session start before ownership deadline"
+                    )),
+                }
+            } else {
+                persist.await
             }
+        } else {
+            Ok(())
+        };
+        if let Err(err) = session_start_result {
+            self.abort_starting_capture(
+                &manager,
+                guild_id,
+                &recorder,
+                runtime_store.as_ref(),
+                hosted_usage.as_ref(),
+                true,
+            )
+            .await;
             return Err(err);
         }
+
+        let handler_lock = manager.get_or_insert(guild_id);
+        let mut handler = if hosted_usage.is_some() {
+            match tokio::time::timeout(HOSTED_START_STEP_TIMEOUT, handler_lock.lock()).await {
+                Ok(handler) => handler,
+                Err(_) => {
+                    self.abort_starting_capture(
+                        &manager,
+                        guild_id,
+                        &recorder,
+                        runtime_store.as_ref(),
+                        hosted_usage.as_ref(),
+                        true,
+                    )
+                    .await;
+                    bail!("timed out preparing hosted voice handlers before ownership deadline");
+                }
+            }
+        } else {
+            handler_lock.lock().await
+        };
+
+        if hosted_usage.is_some() {
+            let store = runtime_store
+                .as_ref()
+                .context("hosted capture omitted its durable runtime store")?;
+            let ids = std::collections::HashSet::from([session_id.clone()]);
+            let ownership = tokio::time::timeout(
+                HOSTED_START_STEP_TIMEOUT,
+                store.heartbeat_hosted_capture_recoveries(&self.recovery_owner_id, &ids),
+            )
+            .await;
+            if !matches!(ownership, Ok(Ok(ref renewed)) if renewed == &ids) {
+                drop(handler);
+                self.abort_starting_capture(
+                    &manager,
+                    guild_id,
+                    &recorder,
+                    runtime_store.as_ref(),
+                    hosted_usage.as_ref(),
+                    false,
+                )
+                .await;
+                bail!("hosted capture ownership was not renewable before voice handlers enabled");
+            }
+        }
+        handler.add_global_event(CoreEvent::SpeakingStateUpdate.into(), receiver.clone());
+        handler.add_global_event(CoreEvent::ClientDisconnect.into(), receiver.clone());
+        handler.add_global_event(CoreEvent::VoiceTick.into(), receiver);
+        drop(handler);
 
         println!(
             "Started Discord capture in guild {} channel {} -> {}",
@@ -2185,6 +2717,7 @@ impl DiscordCaptureHandler {
                 guild_id,
                 channel_id,
                 started_at,
+                base_wav_path,
                 recorder,
                 known_ssrcs,
                 voice_stats,
@@ -2252,32 +2785,71 @@ impl DiscordCaptureHandler {
             return Ok(None);
         };
 
+        let _finalizing_guard = FinalizingRecordingGuard::new(
+            self.finalizing_recording_ids.clone(),
+            active.session_id.clone(),
+        );
+        let result = self.finalize_removed_capture(active).await;
+        result.map(Some)
+    }
+
+    async fn finalize_removed_capture(&self, active: ActiveCapture) -> Result<CapturedSession> {
         let stopped_at = Local::now();
-        let wav_paths_result = finalize_wav(&active.recorder);
+        let mut wav_paths = finalize_wav(&active.recorder)?;
+        if wav_paths.is_empty() && active.hosted_usage.is_some() {
+            // A DB-heartbeat failure self-fences the writer before any network
+            // cleanup. Reconstruct the already-finalized contiguous path list
+            // so normal usage/session finalization can still proceed if the
+            // database becomes reachable during shutdown.
+            wav_paths = checkpointed_wav_paths(&active.base_wav_path)?;
+        }
         active.voice_stats.print(&active.known_ssrcs);
         if let Some((client, reservation)) = &active.hosted_usage {
-            let elapsed_millis = stopped_at
-                .signed_duration_since(active.started_at)
-                .num_milliseconds()
-                .max(1) as u64;
-            let actual_seconds = elapsed_millis
-                .div_ceil(1_000)
-                .min(reservation.reserved_seconds);
-            let occurred_at = stopped_at.with_timezone(&Utc);
+            let base_wav_path = wav_paths
+                .first()
+                .context("hosted capture did not retain its mixed-audio WAV")?;
+            let actual_seconds =
+                recovered_usage_seconds(base_wav_path, reservation.reserved_seconds)?;
             let store = active
                 .runtime_store
                 .as_ref()
                 .context("hosted capture omitted its durable runtime store")?;
-            store
-                .enqueue_hosted_usage(
-                    client,
-                    reservation,
+            let recovery_claim_token = store
+                .claim_live_hosted_capture_finalization(
+                    &reservation.reservation_id,
                     &active.session_id,
-                    actual_seconds,
-                    occurred_at,
+                    &self.recovery_owner_id,
                 )
-                .await
-                .context("failed to durably enqueue hosted usage")?;
+                .await?;
+            if actual_seconds == 0 {
+                client
+                    .release_usage(reservation)
+                    .await
+                    .context("failed to release zero-duration hosted capture")?;
+            } else {
+                let occurred_at = active.started_at.with_timezone(&Utc)
+                    + chrono::Duration::seconds(
+                        i64::try_from(actual_seconds)
+                            .context("hosted usage duration exceeded timestamp range")?,
+                    );
+                store
+                    .enqueue_hosted_usage(
+                        client,
+                        reservation,
+                        &active.session_id,
+                        actual_seconds,
+                        occurred_at,
+                    )
+                    .await
+                    .context("failed to durably enqueue hosted usage")?;
+            }
+            store
+                .remove_claimed_hosted_capture_recovery(
+                    &reservation.reservation_id,
+                    &active.session_id,
+                    &recovery_claim_token,
+                )
+                .await?;
             if let Err(err) = store.retry_hosted_usage_outbox(client).await {
                 eprintln!(
                     "hosted usage for recording {} remains queued for retry: {err:#}",
@@ -2285,7 +2857,6 @@ impl DiscordCaptureHandler {
                 );
             }
         }
-        let wav_paths = wav_paths_result?;
         if let Some(store) = &active.runtime_store {
             if let Err(err) = store
                 .record_session_stopped(&active.session_id, stopped_at)
@@ -2307,7 +2878,7 @@ impl DiscordCaptureHandler {
                 }
             }
         }
-        Ok(Some(CapturedSession {
+        Ok(CapturedSession {
             id: active.session_id,
             guild_id: active.guild_id,
             channel_id: active.channel_id,
@@ -2316,7 +2887,7 @@ impl DiscordCaptureHandler {
             wav_paths,
             runtime_store: active.runtime_store,
             capture_mode: active.capture_mode,
-        }))
+        })
     }
 
     async fn finalize_all_active_captures(&self) -> Result<Vec<CapturedSession>> {
@@ -2330,16 +2901,157 @@ impl DiscordCaptureHandler {
         Ok(sessions)
     }
 
+    fn self_fence_hosted_recorders(&self, guild_ids: &[GuildId]) {
+        for guild_id in guild_ids {
+            self.requested_channels.remove(guild_id);
+            let Some(active) = self.active.get(guild_id) else {
+                continue;
+            };
+            if active.hosted_usage.is_none() {
+                continue;
+            }
+            if let Err(err) = finalize_wav(&active.recorder) {
+                eprintln!(
+                    "failed to finalize self-fenced hosted recording {}: {err:#}",
+                    active.session_id
+                );
+            }
+        }
+    }
+
+    async fn finish_self_fenced_hosted_capture(&self, ctx: &SerenityContext, guild_id: GuildId) {
+        let reconcile_gate = self.reconcile_gate_for(guild_id);
+        let _reconcile_guard = reconcile_gate.lock().await;
+        match songbird::get(ctx).await {
+            Some(manager) if manager.get(guild_id).is_some() => {
+                match tokio::time::timeout(
+                    DISCORD_VOICE_TRANSITION_TIMEOUT,
+                    manager.remove(guild_id),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => eprintln!(
+                        "failed to leave Discord after hosted DB self-fence in guild {}: {err:?}",
+                        guild_id.get()
+                    ),
+                    Err(_) => eprintln!(
+                        "timed out leaving Discord after hosted DB self-fence in guild {}",
+                        guild_id.get()
+                    ),
+                }
+            }
+            _ => {}
+        }
+        match self.finalize_active_capture(guild_id).await {
+            Ok(Some(session)) => {
+                let _ = self.config.session_tx.send(session).await;
+            }
+            Ok(None) => {}
+            Err(err) => eprintln!(
+                "hosted capture in guild {} remains durably recoverable after self-fence: {err:#}",
+                guild_id.get()
+            ),
+        }
+    }
+
+    async fn run_hosted_heartbeat_monitor(
+        self,
+        ctx: SerenityContext,
+        heartbeat_interval: Duration,
+    ) {
+        let mut interval = tokio::time::interval(heartbeat_interval);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let Some(store) = &self.config.runtime_store else {
+                return;
+            };
+            let active_hosted_captures: Vec<_> = self
+                .active
+                .iter()
+                .filter(|active| active.hosted_usage.is_some())
+                .map(|active| (*active.key(), active.session_id.clone()))
+                .collect();
+            if active_hosted_captures.is_empty() {
+                continue;
+            }
+            let active_recording_ids: std::collections::HashSet<_> = active_hosted_captures
+                .iter()
+                .map(|(_, recording_id)| recording_id.clone())
+                .collect();
+            let heartbeated = match tokio::time::timeout(
+                heartbeat_interval,
+                store.heartbeat_hosted_capture_recoveries(
+                    &self.recovery_owner_id,
+                    &active_recording_ids,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(heartbeated)) => Some(heartbeated),
+                Ok(Err(err)) => {
+                    eprintln!(
+                        "hosted active-capture heartbeat failed; self-fencing capture: {err:#}"
+                    );
+                    None
+                }
+                Err(_) => {
+                    eprintln!("hosted active-capture heartbeat timed out; self-fencing capture");
+                    None
+                }
+            };
+            let unowned_guilds =
+                hosted_guilds_without_heartbeat(&active_hosted_captures, heartbeated.as_ref());
+            if unowned_guilds.is_empty() {
+                continue;
+            }
+
+            // Close all affected writers synchronously before voice/network/DB
+            // cleanup. At a ten-second maximum monitor interval and a 60-second
+            // minimum stale threshold, the old owner stops before takeover.
+            self.self_fence_hosted_recorders(&unowned_guilds);
+            for guild_id in unowned_guilds {
+                self.finish_self_fenced_hosted_capture(&ctx, guild_id).await;
+            }
+        }
+    }
+
     async fn run_hosted_poller(self, ctx: SerenityContext, hosted: HostedCaptureConfig) {
+        let heartbeat_interval = hosted
+            .poll_interval
+            .min(Duration::from_secs(10))
+            .max(Duration::from_secs(1));
+        let heartbeat_handler = self.clone();
+        let heartbeat_ctx = ctx.clone();
+        tokio::spawn(async move {
+            heartbeat_handler
+                .run_hosted_heartbeat_monitor(heartbeat_ctx, heartbeat_interval)
+                .await;
+        });
+
         let mut interval = tokio::time::interval(hosted.poll_interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
 
-            if let Some(store) = &self.config.runtime_store
-                && let Err(err) = store.retry_hosted_usage_outbox(&hosted.client).await
-            {
-                eprintln!("hosted usage outbox retry failed: {err:#}");
+            if let Some(store) = &self.config.runtime_store {
+                let recovery_stale_after = heartbeat_interval
+                    .saturating_mul(6)
+                    .max(MIN_HOSTED_RECOVERY_STALE_AFTER);
+                if let Err(err) = store
+                    .retry_hosted_capture_recovery(
+                        &hosted.client,
+                        &self.config.capture_dir,
+                        recovery_stale_after,
+                    )
+                    .await
+                {
+                    eprintln!("hosted active-capture recovery failed: {err:#}");
+                }
+                if let Err(err) = store.retry_hosted_usage_outbox(&hosted.client).await {
+                    eprintln!("hosted usage outbox retry failed: {err:#}");
+                }
             }
 
             let mut reconcile_guilds = std::collections::HashSet::new();
@@ -2567,6 +3279,19 @@ impl DiscordCaptureHandler {
             .is_some_and(|active_generation| active_generation > generation);
         !requested_is_newer && !active_is_newer
     }
+}
+
+#[cfg(feature = "discord")]
+fn hosted_guilds_without_heartbeat(
+    expected: &[(GuildId, String)],
+    heartbeated: Option<&std::collections::HashSet<String>>,
+) -> Vec<GuildId> {
+    expected
+        .iter()
+        .filter_map(|(guild_id, recording_id)| {
+            (!heartbeated.is_some_and(|ids| ids.contains(recording_id))).then_some(*guild_id)
+        })
+        .collect()
 }
 
 #[cfg(feature = "discord")]
@@ -2882,6 +3607,60 @@ fn finalize_wav(recorder: &SharedWavRecorder) -> Result<Vec<PathBuf>> {
         return recorder.finalize();
     }
     Ok(Vec::new())
+}
+
+#[cfg(feature = "discord")]
+fn checkpointed_wav_duration_seconds(base_path: &Path) -> Result<u64> {
+    let segments = checkpointed_wav_paths(base_path)?;
+    let expected_spec = discord_wav_spec();
+    let mut total_samples = 0_u64;
+    for path in segments {
+        let metadata = std::fs::metadata(&path)
+            .with_context(|| format!("failed to inspect recovery WAV {}", path.display()))?;
+        if metadata.len() == 0 {
+            continue;
+        }
+        let reader = hound::WavReader::open(&path)
+            .with_context(|| format!("failed to read checkpointed WAV {}", path.display()))?;
+        if reader.spec() != expected_spec {
+            bail!("checkpointed WAV format did not match Discord capture format");
+        }
+        total_samples = total_samples
+            .checked_add(u64::from(reader.duration()))
+            .context("checkpointed WAV duration overflowed")?;
+    }
+    Ok(total_samples.div_ceil(u64::from(DISCORD_SAMPLE_RATE)))
+}
+
+#[cfg(feature = "discord")]
+fn checkpointed_wav_paths(base_path: &Path) -> Result<Vec<PathBuf>> {
+    let mut segments = vec![(1_u32, base_path.to_path_buf())];
+    let mut missing_segment = false;
+    for index in 2..=MAX_HOSTED_RECOVERY_WAV_SEGMENTS {
+        let path = segment_wav_path(base_path, index);
+        if path.exists() {
+            if missing_segment {
+                bail!("hosted recovery WAV segments were not contiguous");
+            }
+            segments.push((index, path));
+        } else {
+            missing_segment = true;
+        }
+    }
+    if segment_wav_path(base_path, MAX_HOSTED_RECOVERY_WAV_SEGMENTS + 1).exists() {
+        bail!("hosted recovery WAV exceeded the bounded segment count");
+    }
+    for (expected, (actual, _)) in (1_u32..).zip(&segments) {
+        if expected != *actual {
+            bail!("hosted recovery WAV segments were not contiguous");
+        }
+    }
+    Ok(segments.into_iter().map(|(_, path)| path).collect())
+}
+
+#[cfg(feature = "discord")]
+fn recovered_usage_seconds(base_path: &Path, reserved_seconds: u64) -> Result<u64> {
+    Ok(checkpointed_wav_duration_seconds(base_path)?.min(reserved_seconds))
 }
 
 #[cfg(feature = "discord")]
@@ -3864,6 +4643,51 @@ mod tests {
     use serde_json::json;
 
     #[cfg(feature = "discord")]
+    async fn isolated_test_pools() -> Result<Option<(PgPool, PgPool, PgPool, String)>> {
+        let Ok(database_url) = std::env::var("CALL_SCRIBE_TEST_DATABASE_URL") else {
+            return Ok(None);
+        };
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .context("failed to connect to the disposable Postgres test database")?;
+        let schema = format!("call_scribe_test_{}", Uuid::new_v4().simple());
+        sqlx::raw_sql::raw_sql(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await
+            .context("failed to create isolated Postgres test schema")?;
+
+        async fn scoped_pool(database_url: &str, schema: String) -> Result<PgPool> {
+            PgPoolOptions::new()
+                .max_connections(2)
+                .after_connect(move |connection, _metadata| {
+                    let statement = format!("SET search_path TO {schema}");
+                    Box::pin(async move {
+                        sqlx::query::query(&statement).execute(connection).await?;
+                        Ok(())
+                    })
+                })
+                .connect(database_url)
+                .await
+                .context("failed to connect to isolated Postgres test schema")
+        }
+
+        let first = scoped_pool(&database_url, schema.clone()).await?;
+        let second = scoped_pool(&database_url, schema.clone()).await?;
+        Ok(Some((admin, first, second, schema)))
+    }
+
+    #[cfg(feature = "discord")]
+    async fn drop_test_schema(admin: &PgPool, schema: &str) -> Result<()> {
+        sqlx::raw_sql::raw_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(admin)
+            .await
+            .context("failed to drop isolated Postgres test schema")?;
+        Ok(())
+    }
+
+    #[cfg(feature = "discord")]
     fn discord_capture_handler_for_test(
         allowed_channel_id: Option<ChannelId>,
         trigger_user_id: Option<UserId>,
@@ -4203,5 +5027,256 @@ mod tests {
         let second_gate = handler.reconcile_gate_for(GuildId::new(2));
 
         assert!(second_gate.try_lock().is_ok());
+    }
+
+    #[cfg(feature = "discord")]
+    #[test]
+    fn crash_recovery_uses_only_checkpointed_audio_duration() {
+        let test_dir =
+            std::env::temp_dir().join(format!("call-scribe-crash-duration-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).expect("test capture directory should be created");
+        let wav_path = test_dir.join("capture.wav");
+        let mut writer = hound::WavWriter::create(&wav_path, discord_wav_spec())
+            .expect("test WAV should be created");
+        let samples_per_second =
+            usize::try_from(DISCORD_SAMPLE_RATE).unwrap() * usize::from(DISCORD_CHANNELS);
+        for _ in 0..(2 * samples_per_second) {
+            writer.write_sample(0_i16).expect("sample should write");
+        }
+        writer.flush().expect("two seconds should be checkpointed");
+        for _ in 0..samples_per_second {
+            writer
+                .write_sample(0_i16)
+                .expect("uncheckpointed sample should write");
+        }
+
+        // Simulate abrupt process loss: do not drop/finalize the writer. The
+        // recovery boundary may bill only the valid duration in the last
+        // checkpointed WAV header, never started_at-to-now wall time.
+        std::mem::forget(writer);
+        assert_eq!(
+            checkpointed_wav_duration_seconds(&wav_path)
+                .expect("checkpointed duration should be recoverable"),
+            2
+        );
+        assert_eq!(
+            recovered_usage_seconds(&wav_path, 1)
+                .expect("recovered usage must remain reservation-bounded"),
+            1
+        );
+
+        let skipped_segment_path = segment_wav_path(&wav_path, 3);
+        hound::WavWriter::create(&skipped_segment_path, discord_wav_spec())
+            .expect("skipped test WAV should be created")
+            .finalize()
+            .expect("skipped test WAV should finalize");
+        assert!(
+            checkpointed_wav_duration_seconds(&wav_path).is_err(),
+            "a missing segment must stay pending instead of undercounting"
+        );
+
+        std::fs::remove_dir_all(&test_dir).expect("test capture directory should be removed");
+    }
+
+    #[cfg(feature = "discord")]
+    #[tokio::test]
+    async fn hosted_outbox_upgrade_migration_clears_terminal_lease_material() -> Result<()> {
+        let Some((admin, first, _second, schema)) = isolated_test_pools().await? else {
+            eprintln!("CALL_SCRIBE_TEST_DATABASE_URL is unset; skipping Postgres migration proof");
+            return Ok(());
+        };
+
+        sqlx::raw_sql::raw_sql(include_str!(
+            "../migrations/20260812010000_hosted_worker_command_executions.sql"
+        ))
+        .execute(&first)
+        .await?;
+        sqlx::query::query(
+            r#"
+INSERT INTO call_scribe_hosted_usage_outbox
+    (reservation_id, encrypted_lease_token, encryption_nonce, recording_id,
+     actual_seconds, occurred_at, expires_at, status)
+VALUES ('reservation-upgrade', '\x01', '\x02', 'recording-upgrade',
+        1, now(), now() + interval '1 hour', 'delivered')
+"#,
+        )
+        .execute(&first)
+        .await?;
+
+        migrate_runtime_schema(&first).await?;
+        migrate_runtime_schema(&first).await?;
+
+        let terminal_material: (Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as::query_as(
+            r#"
+SELECT encrypted_lease_token, encryption_nonce
+FROM call_scribe_hosted_usage_outbox
+WHERE reservation_id = 'reservation-upgrade'
+"#,
+        )
+        .fetch_one(&first)
+        .await?;
+        assert_eq!(terminal_material, (None, None));
+
+        let invalid_pending = sqlx::query::query(
+            r#"
+INSERT INTO call_scribe_hosted_usage_outbox
+    (reservation_id, encrypted_lease_token, encryption_nonce, recording_id,
+     actual_seconds, occurred_at, expires_at, status)
+VALUES ('reservation-invalid', NULL, NULL, 'recording-invalid',
+        1, now(), now() + interval '1 hour', 'pending')
+"#,
+        )
+        .execute(&first)
+        .await;
+        assert!(
+            invalid_pending.is_err(),
+            "upgraded outbox must reject pending rows without encrypted lease material"
+        );
+
+        first.close().await;
+        drop_test_schema(&admin, &schema).await?;
+        admin.close().await;
+        Ok(())
+    }
+
+    #[cfg(feature = "discord")]
+    #[tokio::test]
+    async fn two_instances_cannot_recover_a_live_heartbeating_capture() -> Result<()> {
+        let Some((admin, first, second, schema)) = isolated_test_pools().await? else {
+            eprintln!("CALL_SCRIBE_TEST_DATABASE_URL is unset; skipping Postgres replica proof");
+            return Ok(());
+        };
+        migrate_runtime_schema(&first).await?;
+        let first_store = SqlxRuntimeStore {
+            pool: first.clone(),
+            organization_id: "org-test".to_string(),
+            capture_mode: CaptureMode::RecordOnly,
+        };
+        let second_store = SqlxRuntimeStore {
+            pool: second.clone(),
+            organization_id: "org-test".to_string(),
+            capture_mode: CaptureMode::RecordOnly,
+        };
+
+        sqlx::query::query(
+            r#"
+INSERT INTO call_scribe_hosted_capture_recovery
+    (reservation_id, encrypted_lease_token, encryption_nonce, recording_id,
+     base_wav_path, reserved_seconds, started_at, expires_at, owner_instance_id)
+VALUES ('reservation-live', '\x01', '\x02', 'recording-live',
+        '/captures/live.wav', 300, now() - interval '1 minute',
+        now() + interval '1 hour', 'instance-a')
+"#,
+        )
+        .execute(&first)
+        .await?;
+
+        let second_claim = second_store
+            .claim_abandoned_hosted_capture_recoveries(Duration::from_secs(60), "claim-b")
+            .await?;
+        assert!(
+            second_claim.is_empty(),
+            "instance B must not recover instance A's fresh live capture"
+        );
+
+        let active_ids = std::collections::HashSet::from(["recording-live".to_string()]);
+        let heartbeated = first_store
+            .heartbeat_hosted_capture_recoveries("instance-a", &active_ids)
+            .await?;
+        assert_eq!(heartbeated, active_ids);
+        assert!(
+            second_store
+                .claim_abandoned_hosted_capture_recoveries(Duration::from_secs(60), "claim-b")
+                .await?
+                .is_empty(),
+            "a renewed DB heartbeat must remain authoritative across pools"
+        );
+
+        sqlx::query::query(
+            r#"
+UPDATE call_scribe_hosted_capture_recovery
+SET heartbeat_at = now() - interval '2 minutes'
+WHERE reservation_id = 'reservation-live'
+"#,
+        )
+        .execute(&first)
+        .await?;
+        let abandoned = second_store
+            .claim_abandoned_hosted_capture_recoveries(Duration::from_secs(60), "claim-b")
+            .await?;
+        assert_eq!(
+            abandoned.len(),
+            1,
+            "stale ownership must become recoverable"
+        );
+        assert!(
+            first_store
+                .heartbeat_hosted_capture_recoveries("instance-a", &active_ids)
+                .await?
+                .is_empty(),
+            "the previous owner must not renew a recovery after it was fenced"
+        );
+        assert!(
+            first_store
+                .remove_live_hosted_capture_recovery(
+                    "reservation-live",
+                    "recording-live",
+                    "instance-a",
+                )
+                .await
+                .is_err(),
+            "the previous owner must not delete a claimed recovery"
+        );
+        assert!(
+            second_store
+                .remove_claimed_hosted_capture_recovery(
+                    "reservation-live",
+                    "recording-live",
+                    "wrong-claim",
+                )
+                .await
+                .is_err(),
+            "a stale recovery claimant must not cross the claim-token fence"
+        );
+        second_store
+            .remove_claimed_hosted_capture_recovery("reservation-live", "recording-live", "claim-b")
+            .await?;
+
+        first.close().await;
+        second.close().await;
+        drop_test_schema(&admin, &schema).await?;
+        admin.close().await;
+        Ok(())
+    }
+
+    #[cfg(feature = "discord")]
+    #[test]
+    fn missing_or_failed_heartbeat_self_fences_only_unowned_guilds() {
+        let expected = vec![
+            (GuildId::new(1), "recording-a".to_string()),
+            (GuildId::new(2), "recording-b".to_string()),
+        ];
+        let renewed = std::collections::HashSet::from(["recording-a".to_string()]);
+
+        assert_eq!(
+            hosted_guilds_without_heartbeat(&expected, Some(&renewed)),
+            vec![GuildId::new(2)]
+        );
+        assert_eq!(
+            hosted_guilds_without_heartbeat(&expected, None),
+            vec![GuildId::new(1), GuildId::new(2)],
+            "a heartbeat query failure must self-fence every hosted capture"
+        );
+    }
+
+    #[cfg(feature = "discord")]
+    #[test]
+    fn hosted_start_revalidates_ownership_before_stale_takeover() {
+        let maximum_pre_activation_window =
+            DISCORD_VOICE_TRANSITION_TIMEOUT + HOSTED_START_STEP_TIMEOUT.saturating_mul(3);
+        assert!(
+            maximum_pre_activation_window < MIN_HOSTED_RECOVERY_STALE_AFTER,
+            "join, session persistence, handler acquisition, and final ownership renewal must finish before another replica may claim the row"
+        );
     }
 }

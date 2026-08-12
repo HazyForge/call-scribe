@@ -159,10 +159,32 @@ stored. The worker retries idempotent consumption every 30 seconds only inside
 alert instead of retrying forever. Keep the outbox key available through the
 maximum reservation lifetime when rotating it.
 
-Crash recovery for a process that dies during an active capture, before final
-duration is known, remains part of the production release gate alongside hosted
-artifact delivery. All hosted storage providers remain disabled in this branch,
-so no reservation or audio capture can enter this path yet.
+Before joining Discord voice, the worker also persists an encrypted active
+reservation recovery row containing the recording ID and mixed-audio base WAV
+path. Each process uses a unique runtime owner ID and renews a database-visible
+heartbeat at least every ten seconds. Another replica can claim only an owner
+stale for at least 60 seconds, and every retry/delete is fenced by the current
+claim token. During startup, Discord join and each database/handler step are
+bounded and ownership is renewed once more before voice handlers are enabled.
+A heartbeat failure or ownership mismatch makes the old process synchronously
+close its hosted WAV writers before any Discord, network, or database cleanup,
+so a partitioned replica cannot keep recording past its ownership lease.
+
+WAV headers are checkpointed every five seconds. After a process or pod crash,
+the next worker derives usage only from valid, contiguous mixed-audio WAV
+segment headers. It never derives billable duration from `startedAt` to the
+current wall clock. The recovered duration is rounded up to a whole second,
+clamped to `reservedSeconds`, and idempotently moved to the normal usage outbox;
+a zero-duration capture releases the reservation. Invalid or missing audio
+stays pending inside `expiresAt` and becomes a visible terminal
+operator-reconciliation item afterward.
+
+Recovery requires durable shared access to both Postgres and `captureDir`
+across pod replacement. A hard crash can discard audio written after the most
+recent WAV checkpoint, so recovery intentionally may undercount by less than
+the five-second checkpoint interval rather than bill unpersisted wall-clock
+time. All hosted storage providers remain disabled in this branch, so no
+reservation or audio capture can enter this path yet.
 
 ## Rollout
 
@@ -176,7 +198,9 @@ export CALL_SCRIBE_HOSTED_WORKER_ID=worker-production-01
 cargo run --features discord -- discord --repo /meetings --skip-analysis
 ```
 
-Use one active process for a Discord bot token. Rotate the workload credential
-independently, retain the previous credential only for a bounded overlap, and
-verify config fetch, command acknowledgement, voice join/leave, retained audio,
-and usage reconciliation before production enablement.
+Use one active process for a Discord bot token; the database ownership fence is
+defense in depth for rolling replacement and split ownership, not permission to
+run two Discord consumers normally. Rotate the workload credential independently,
+retain the previous credential only for a bounded overlap, and verify config
+fetch, command acknowledgement, voice join/leave, retained audio, and usage
+reconciliation before production enablement.
