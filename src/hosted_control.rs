@@ -995,7 +995,7 @@ fn validate_prepared_upload(
     }
     let url = Url::parse(&prepared.upload.url).context("hosted upload URL was invalid")?;
     if prepared.upload.url.len() > MAX_SIGNED_UPLOAD_URL_BYTES
-        || !provider_url_scheme_is_allowed(&url)
+        || !provider_url_origin_is_allowed(&url)
         || !url.username().is_empty()
         || url.password().is_some()
         || url.fragment().is_some()
@@ -1077,7 +1077,7 @@ fn validate_signed_verification(
     }
     let url = Url::parse(&verification.url).context("hosted verification URL was invalid")?;
     if verification.url.len() > MAX_SIGNED_UPLOAD_URL_BYTES
-        || !provider_url_scheme_is_allowed(&url)
+        || !provider_url_origin_is_allowed(&url)
         || !url.username().is_empty()
         || url.password().is_some()
         || url.fragment().is_some()
@@ -1252,9 +1252,12 @@ fn valid_pinned_provider_host(provider: &str, host: &str) -> bool {
     host.len() <= 253 && provider_host_is_allowed(provider, host)
 }
 
-fn provider_url_scheme_is_allowed(url: &Url) -> bool {
-    url.scheme() == "https"
-        || (cfg!(test) && url.scheme() == "http" && url.host_str().is_some_and(is_loopback_host))
+fn provider_url_origin_is_allowed(url: &Url) -> bool {
+    (url.scheme() == "https" && url.port_or_known_default() == Some(443))
+        || (cfg!(test)
+            && url.scheme() == "http"
+            && url.port().is_some()
+            && url.host_str().is_some_and(is_loopback_host))
 }
 
 fn valid_object_key(value: &str) -> bool {
@@ -2233,6 +2236,25 @@ mod tests {
         let prepared = prepared_upload("customer_s3", "bucket.s3.us-east-1.amazonaws.com");
         assert!(validate_prepared_upload(&prepared, &request, &s3).is_ok());
 
+        let mut explicit_default_port = prepared.clone();
+        explicit_default_port.upload.url = explicit_default_port.upload.url.replacen(
+            "bucket.s3.us-east-1.amazonaws.com/",
+            "bucket.s3.us-east-1.amazonaws.com:443/",
+            1,
+        );
+        assert!(validate_prepared_upload(&explicit_default_port, &request, &s3).is_ok());
+
+        let mut nonstandard_port = prepared.clone();
+        nonstandard_port.upload.url = nonstandard_port.upload.url.replacen(
+            "bucket.s3.us-east-1.amazonaws.com/",
+            "bucket.s3.us-east-1.amazonaws.com:8443/",
+            1,
+        );
+        assert!(
+            validate_prepared_upload(&nonstandard_port, &request, &s3).is_err(),
+            "the pinned provider host must not authorize a different HTTPS origin port"
+        );
+
         let r2 = artifact_destination("customer_r2");
         let prepared = prepared_upload("customer_r2", "accountid.r2.cloudflarestorage.com");
         assert!(validate_prepared_upload(&prepared, &request, &r2).is_ok());
@@ -2301,6 +2323,7 @@ mod tests {
         let destination = artifact_destination("customer_s3");
         let valid = prepared_upload("customer_s3", &destination.allowed_host);
         assert!(validate_prepared_upload(&valid, &request, &destination).is_ok());
+        assert_eq!(valid.upload.expires_at.timestamp_subsec_nanos(), 0);
 
         let mut overlong = valid.clone();
         overlong.upload.url = overlong
@@ -2314,10 +2337,43 @@ mod tests {
         detached_mismatch.upload.expires_at += chrono::Duration::seconds(1);
         assert!(validate_prepared_upload(&detached_mismatch, &request, &destination).is_err());
 
+        let mut fractional_detached_expiry = valid.clone();
+        fractional_detached_expiry.upload.expires_at += chrono::Duration::nanoseconds(1);
+        assert!(
+            validate_prepared_upload(&fractional_detached_expiry, &request, &destination).is_err(),
+            "detached expiry must be the exact whole-second SigV4 expiry"
+        );
+
         let mut unsigned_integrity = valid;
         unsigned_integrity.upload.url =
             unsigned_integrity.upload.url.replace("content-length;", "");
         assert!(validate_prepared_upload(&unsigned_integrity, &request, &destination).is_err());
+    }
+
+    #[test]
+    fn signed_verification_rejects_nonstandard_https_port() {
+        let destination = artifact_destination("customer_s3");
+        let prepared = prepared_upload("customer_s3", &destination.allowed_host);
+        let operation = ArtifactDeliveryOperationRef::from(&prepared);
+        let (url, expires_at) = sigv4_url(
+            &destination.allowed_host,
+            &operation.object_key,
+            "host;x-amz-checksum-mode",
+        );
+        let verification = SignedArtifactVerification {
+            url: url.replacen(
+                "bucket.s3.us-east-1.amazonaws.com/",
+                "bucket.s3.us-east-1.amazonaws.com:8443/",
+                1,
+            ),
+            method: "HEAD".to_string(),
+            headers: HashMap::from([("x-amz-checksum-mode".to_string(), "ENABLED".to_string())]),
+            expires_at,
+        };
+        assert!(
+            validate_signed_verification(&verification, &operation, &destination).is_err(),
+            "the pinned provider host must not authorize HEAD on another HTTPS origin port"
+        );
     }
 
     #[test]

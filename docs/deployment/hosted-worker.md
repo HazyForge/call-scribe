@@ -249,14 +249,16 @@ the reservation and responds with `operationId`, positive `generation`, exact
 echoes of `recordingId`, `artifactId`, `artifactKind`, and `segmentIndex`, an
 opaque safe `objectKey`, pinned destination ID/revision/provider, the exact
 configuration-pinned `allowedUploadHost`, and a short-lived HTTPS `PUT` URL
-plus signed headers. The URL path must be exactly `/<objectKey>`. The worker
-accepts no redirects and does not let the response choose the value used to
-approve its own host. Only AWS S3 hosts ending in `amazonaws.com` with an `s3`
-DNS label or the exact `<account>.r2.cloudflarestorage.com` host shape may be
-pinned by configuration. S3 uses bucket-qualified virtual-host style. Because
-R2 uses an account-qualified host with path-style buckets, the independently
-pinned `storageObjectKeyPrefix` begins with the destination bucket and tenant
-prefix. Every returned object key must remain under the pinned prefix for both
+plus signed headers. The URL must use effective HTTPS port 443, and its path
+must be exactly `/<objectKey>`; an explicit alternate port is a different
+origin and is rejected. The worker accepts no redirects and does not let the
+response choose the value used to approve its own host. Only AWS S3 hosts
+ending in `amazonaws.com` with an `s3` DNS label or the exact
+`<account>.r2.cloudflarestorage.com` host shape may be pinned by configuration.
+S3 uses bucket-qualified virtual-host style. Because R2 uses an
+account-qualified host with path-style buckets, the independently pinned
+`storageObjectKeyPrefix` begins with the destination bucket and tenant prefix.
+Every returned object key must remain under the pinned prefix for both
 providers.
 
 The worker parses the actual SigV4 query, not only the detached JSON expiry. It
