@@ -50,6 +50,11 @@ connectivity, storage, and the image. Scale to one replica only after any
 previous worker using the same Discord bot token is stopped. Do not run two
 workers with the same token.
 
+For the optional SaaS adapter, set `hosted.enabled=true`, the HTTPS control
+plane URL, and a dedicated Secret containing the workload token. See
+[hosted-worker.md](hosted-worker.md) for the API contract and fail-closed gate.
+The public chart never accepts Stripe credentials.
+
 ## ZITADEL and API rollout order
 
 1. Apply the reviewed declarative ZITADEL project, role, user grant, and

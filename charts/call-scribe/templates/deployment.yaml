@@ -66,6 +66,26 @@ spec:
               value: {{ .Values.config.captureMode | quote }}
             - name: CALL_SCRIBE_ORGANIZATION_ID
               value: {{ .Values.config.organizationId | quote }}
+            {{- if .Values.hosted.enabled }}
+            - name: CALL_SCRIBE_HOSTED_CONTROL_PLANE_URL
+              value: {{ required "hosted.controlPlaneUrl is required when hosted.enabled=true" .Values.hosted.controlPlaneUrl | quote }}
+            - name: CALL_SCRIBE_HOSTED_WORKER_ID
+              value: {{ .Values.hosted.workerId | quote }}
+            - name: CALL_SCRIBE_HOSTED_POLL_SECONDS
+              value: {{ .Values.hosted.pollSeconds | quote }}
+            - name: CALL_SCRIBE_HOSTED_MAX_STALENESS_SECONDS
+              value: {{ .Values.hosted.maxStalenessSeconds | quote }}
+            - name: CALL_SCRIBE_HOSTED_WORKLOAD_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "hosted.workloadCredentials.existingSecret is required when hosted.enabled=true" .Values.hosted.workloadCredentials.existingSecret | quote }}
+                  key: {{ .Values.hosted.workloadCredentials.tokenKey | quote }}
+            - name: CALL_SCRIBE_HOSTED_OUTBOX_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.hosted.workloadCredentials.existingSecret | quote }}
+                  key: {{ .Values.hosted.workloadCredentials.outboxEncryptionKey | quote }}
+            {{- end }}
             - name: ELEVENLABS_STT_TIMEOUT_SECONDS
               value: {{ .Values.config.sttTimeoutSeconds | quote }}
             - name: ELEVENLABS_STT_DIARIZE
