@@ -31,6 +31,20 @@ config:
   captureMode: record-only
   organizationId: org_private_alpha
 
+# Optional SaaS adapter. The public worker contains no billing logic; it accepts
+# only the control plane's short-lived recording policy and durable commands.
+# Hosted mode cannot be combined with static Discord guild/channel settings.
+hosted:
+  enabled: false
+  controlPlaneUrl: ""
+  workerId: call-scribe-worker
+  pollSeconds: 15
+  maxStalenessSeconds: 60
+  workloadCredentials:
+    existingSecret: ""
+    tokenKey: CALL_SCRIBE_HOSTED_WORKLOAD_TOKEN
+    outboxEncryptionKey: CALL_SCRIBE_HOSTED_OUTBOX_ENCRYPTION_KEY
+
 api:
   enabled: false
   replicaCount: 1

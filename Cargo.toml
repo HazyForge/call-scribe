@@ -11,7 +11,7 @@ categories = ["command-line-utilities", "multimedia::audio"]
 
 [features]
 default = []
-discord = ["dep:dashmap", "dep:hound", "dep:rustls", "dep:serenity", "dep:songbird"]
+discord = ["dep:chacha20poly1305", "dep:dashmap", "dep:hound", "dep:rustls", "dep:serenity", "dep:songbird"]
 
 [dependencies]
 anyhow = "1.0"
@@ -19,6 +19,7 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+chacha20poly1305 = { version = "0.10", optional = true }
 clap = { version = "4.5", features = ["derive", "env"] }
 dashmap = { version = "6.1", optional = true }
 hound = { version = "3.5", optional = true }

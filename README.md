@@ -133,6 +133,12 @@ Phone calls need a telephony adapter such as Twilio recording webhooks. The webh
 
 Always get participant consent before recording or transcribing calls.
 
+For a separate SaaS control plane, use the fail-closed hosted adapter described
+in [docs/deployment/hosted-worker.md](docs/deployment/hosted-worker.md). It keeps
+billing and product identity outside this public recorder, disables hosted
+occupancy auto-start, and requires fresh entitlement/channel/consent/cap policy
+plus an explicit durable start command.
+
 ## Troubleshooting Capture Gaps
 
 Switching Discord from desktop to phone should still be recorded by the bot as long as the phone client is actually joined to the configured guild voice/stage channel and transmitting audio. The bot records what Discord receives in that channel; it cannot recover audio that only reached a local screen recorder, a handset, Bluetooth route, or a separate phone call.
