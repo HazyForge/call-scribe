@@ -27,6 +27,9 @@ conditions:
 - a notice channel is configured;
 - a retention period from 1 through 365 days is configured;
 - the monthly recording cap exists and has remaining seconds; and
+- a versioned opaque `customer_s3` or `customer_r2` destination is pinned with
+  its exact normalized account/bucket host and
+  `delete_after_verified_delivery`; and
 - at least one human participant is currently in the requested channel.
 
 Missing configuration, a failed first fetch, stale configuration, malformed
@@ -43,12 +46,13 @@ All requests use `Authorization: Bearer <workload token>` and include
 the server must bind the token to the configured worker ID and should keep
 these internal routes on private ingress or require workload mTLS.
 
-This incremental adapter does not yet implement a hosted storage destination.
-Every current provider (`customer_s3`, `customer_r2`, `google_drive`, and
-`managed_transient`) therefore fails closed at the worker, even when the
-control plane reports it as ready. Hosted recording remains disabled until a
-provider adapter uploads, verifies, and deletes or retains transient local data
-according to policy. Self-hosted local/PVC capture is unchanged.
+Hosted capture remains raw-audio record-only. The worker can deliver finalized
+WAV segments to `customer_s3` or `customer_r2` through short-lived,
+exact-object grants issued by the private control plane. It never receives or
+stores the customer's reusable storage credentials. Unsupported providers,
+missing destination ID/revision, and any transient policy except
+`delete_after_verified_delivery` fail closed. Self-hosted local/PVC capture and
+transcript content behavior are unchanged.
 
 `GET /internal/v1/worker/guild-configurations`
 
@@ -71,6 +75,11 @@ according to policy. Self-hosted local/PVC capture is unchanged.
       "remainingRecordingSeconds": 35900,
       "storageProvider": "customer_s3",
       "storageDestinationLabel": "Customer archive",
+      "storageDestinationId": "dst_01",
+      "storageDestinationRevision": "dstrev_04",
+      "storageAllowedHost": "customer-audio.s3.us-east-1.amazonaws.com",
+      "storageObjectKeyPrefix": "tenant-opaque-prefix/",
+      "transientDeletePolicy": "delete_after_verified_delivery",
       "ready": true,
       "blockedReasons": [],
       "desiredRecordingGeneration": 42
@@ -200,13 +209,82 @@ capture releases the reservation. Invalid or missing audio stays pending only
 inside the bounded settlement window and becomes a visible terminal
 operator-reconciliation item afterward. Recovery settles an abandoned capture;
 it never resumes capture or renews recording authority after a process crash.
+Header-only zero-duration WAVs never enter artifact delivery or delivery
+backpressure. Their paths are atomically placed in a separate crash-safe local
+cleanup outbox with session-stop evidence; cleanup revalidates that each target
+is a regular zero-sample WAV inside `captureDir` before removing it.
 
 Recovery requires durable shared access to both Postgres and `captureDir`
 across pod replacement. A hard crash can discard audio written after the most
 recent WAV checkpoint, so recovery intentionally may undercount by less than
 the five-second checkpoint interval rather than bill unpersisted wall-clock
-time. All hosted storage providers remain disabled in this branch, so no
-reservation or audio capture can enter this path yet.
+time.
+
+At finalization, the worker hashes each regular, non-symlink WAV and atomically
+persists the runtime artifact, immutable manifest, encrypted reservation lease,
+delivery job, usage job, stop evidence, and removal of capture recovery. It
+then calls `POST /internal/v1/worker/artifact-deliveries/prepare` with only the
+reservation authority and exact object manifest:
+
+```json
+{
+  "reservationId": "reservation_01",
+  "leaseToken": "opaque-reservation-lease",
+  "recordingId": "recording_01",
+  "artifactId": "artifact_01",
+  "artifactKind": "raw_audio_wav",
+  "segmentIndex": 1,
+  "contentLength": 123456,
+  "sha256": "64-lowercase-hex-characters",
+  "contentType": "audio/wav"
+}
+```
+
+Hosted capture disables per-SSRC source-stem creation, so the mixed WAV segment
+list is the exhaustive sensitive-audio manifest. Self-hosted source-stem
+behavior remains available and unchanged.
+
+The control plane derives organization, guild, destination, and object key from
+the reservation and responds with `operationId`, positive `generation`, exact
+echoes of `recordingId`, `artifactId`, `artifactKind`, and `segmentIndex`, an
+opaque safe `objectKey`, pinned destination ID/revision/provider, the exact
+configuration-pinned `allowedUploadHost`, and a short-lived HTTPS `PUT` URL
+plus signed headers. The URL path must be exactly `/<objectKey>`. The worker
+accepts no redirects and does not let the response choose the value used to
+approve its own host. Only AWS S3 hosts ending in `amazonaws.com` with an `s3`
+DNS label or the exact `<account>.r2.cloudflarestorage.com` host shape may be
+pinned by configuration. S3 uses bucket-qualified virtual-host style. Because
+R2 uses an account-qualified host with path-style buckets, the independently
+pinned `storageObjectKeyPrefix` begins with the destination bucket and tenant
+prefix. Every returned object key must remain under the pinned prefix for both
+providers.
+
+The worker parses the actual SigV4 query, not only the detached JSON expiry. It
+requires `AWS4-HMAC-SHA256`, a valid `s3/aws4_request` credential scope,
+`X-Amz-Date`, `X-Amz-Expires` of at most ten minutes, a 64-character lowercase
+signature, and a sorted `X-Amz-SignedHeaders` containing `host` plus every
+outgoing header. The SigV4 expiry must exactly equal `expiresAt` and remain
+inside the live policy window. Signed upload headers bind content type, length,
+and `x-amz-meta-callscribe-sha256`. AWS S3 additionally requires
+`x-amz-checksum-sha256` containing the base64 raw digest; R2 rejects that
+unsupported full-object checksum header. Uploads time out within eight minutes
+under a fifteen-minute database claim.
+
+After upload, the worker posts the generation and exact recording, artifact,
+kind, segment, and object-key identity to
+`/internal/v1/worker/artifact-deliveries/<operation-id>/verify`. The response
+contains an audit receipt carrying the same full identity and a separate
+short-lived presigned provider `HEAD` capability. The worker validates that
+capability with the same exact host, object path, and SigV4 rules, then calls
+the provider directly. A matching control-plane receipt alone never authorizes
+deletion. The provider `HEAD` must return the exact content length and
+`x-amz-meta-callscribe-sha256`; AWS S3 must also return its provider-verified
+`x-amz-checksum-sha256`. Only then does the worker persist verification, delete
+the local WAV, and mark delivery final. It never stores either presigned URL or
+its headers. Failed uploads or verification retain the local WAV for fenced
+retry, and an unsafe delivery older than ten minutes backpressures later hosted
+starts for that organization/guild. After twenty attempts the job is terminal
+and still backpressures capture for operator reconciliation.
 
 ## Rollout
 

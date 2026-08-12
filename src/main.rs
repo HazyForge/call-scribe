@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use std::{
     collections::HashMap,
     fs::File,
-    io::BufWriter,
+    io::{BufWriter, Read},
     num::NonZeroU8,
     ops::DerefMut,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -15,6 +15,8 @@ use std::{
 };
 
 use anyhow::{Context as AnyhowContext, Result, bail};
+#[cfg(all(feature = "discord", test))]
+use base64::Engine;
 use chrono::Local;
 #[cfg(feature = "discord")]
 use chrono::{DateTime, Utc};
@@ -30,8 +32,10 @@ mod providers;
 
 #[cfg(feature = "discord")]
 use hosted_control::{
-    HostedConfigurationStore, HostedControlPlaneClient, RESERVATION_EXPIRY_MARGIN,
-    RESERVATION_SETTLEMENT_GRACE, UsageReservation, WorkerCommand,
+    ArtifactDeliveryOperationRef, ArtifactDeliveryPrepareRequest, ArtifactDeliveryReceipt,
+    ArtifactDeliveryVerification, HostedConfigurationStore, HostedControlPlaneClient,
+    HostedStorageDestination, RESERVATION_EXPIRY_MARGIN, RESERVATION_SETTLEMENT_GRACE,
+    UsageReservation, WorkerCommand,
 };
 use providers::{
     ElevenLabsSttConfig, ElevenLabsSttProvider, OpenAiSttConfig, OpenAiSttProvider,
@@ -50,11 +54,15 @@ use serenity::client::{Client, Context as SerenityContext, EventHandler};
 #[cfg(feature = "discord")]
 use serenity::prelude::GatewayIntents;
 #[cfg(feature = "discord")]
+use sha2::{Digest, Sha256};
+#[cfg(feature = "discord")]
 use songbird::driver::{DecodeConfig, DecodeMode};
 #[cfg(feature = "discord")]
 use songbird::model::payload::{ClientDisconnect, Speaking};
 #[cfg(feature = "discord")]
 use songbird::{Config as SongbirdConfig, CoreEvent, EventContext, SerenityInit, Songbird};
+#[cfg(feature = "discord")]
+use sqlx::row::Row;
 use sqlx_postgres::PgPool;
 #[cfg(feature = "discord")]
 use sqlx_postgres::PgPoolOptions;
@@ -95,6 +103,12 @@ const MIN_HOSTED_RECOVERY_STALE_AFTER: Duration = Duration::from_secs(60);
 const HOSTED_START_STEP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(feature = "discord")]
 const HOSTED_AUTHORITY_WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(feature = "discord")]
+const HOSTED_DELIVERY_CLAIM_TTL: Duration = Duration::from_secs(15 * 60);
+#[cfg(feature = "discord")]
+const HOSTED_DELIVERY_BACKPRESSURE_AGE: Duration = Duration::from_secs(10 * 60);
+#[cfg(feature = "discord")]
+const HOSTED_DELIVERY_MAX_ATTEMPTS: i32 = 20;
 #[cfg(feature = "discord")]
 const DISCORD_PLAYOUT_BUFFER_PACKETS: u8 = 12;
 #[cfg(feature = "discord")]
@@ -392,6 +406,7 @@ pub(crate) async fn migrate_runtime_schema(pool: &PgPool) -> Result<()> {
         include_str!("../migrations/20260803160000_browser_sessions.sql"),
         include_str!("../migrations/20260812010000_hosted_worker_command_executions.sql"),
         include_str!("../migrations/20260812020000_hosted_capture_crash_recovery.sql"),
+        include_str!("../migrations/20260812030000_hosted_artifact_delivery_outbox.sql"),
     ] {
         sqlx::raw_sql::raw_sql(migration)
             .execute(pool)
@@ -552,7 +567,87 @@ type HostedCaptureRecoveryRow = (
     i64,
     DateTime<Utc>,
     DateTime<Utc>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
 );
+
+#[cfg(feature = "discord")]
+type HostedPinnedRecoveryRow = (
+    Vec<u8>,
+    Vec<u8>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+#[cfg(feature = "discord")]
+struct HostedArtifactDeliveryRow {
+    artifact_id: String,
+    recording_id: String,
+    reservation_id: String,
+    encrypted_lease_token: Vec<u8>,
+    encryption_nonce: Vec<u8>,
+    segment_index: i32,
+    local_path: String,
+    content_length: i64,
+    sha256: String,
+    storage_provider: String,
+    storage_destination_id: String,
+    storage_destination_revision: String,
+    storage_allowed_host: String,
+    storage_object_key_prefix: String,
+    transient_delete_policy: String,
+    operation_id: Option<String>,
+    operation_generation: Option<i64>,
+    operation_object_key: Option<String>,
+}
+
+#[cfg(feature = "discord")]
+impl<'r> sqlx::from_row::FromRow<'r, sqlx_postgres::PgRow> for HostedArtifactDeliveryRow {
+    fn from_row(row: &'r sqlx_postgres::PgRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            artifact_id: row.try_get("artifact_id")?,
+            recording_id: row.try_get("recording_id")?,
+            reservation_id: row.try_get("reservation_id")?,
+            encrypted_lease_token: row.try_get("encrypted_lease_token")?,
+            encryption_nonce: row.try_get("encryption_nonce")?,
+            segment_index: row.try_get("segment_index")?,
+            local_path: row.try_get("local_path")?,
+            content_length: row.try_get("content_length")?,
+            sha256: row.try_get("sha256")?,
+            storage_provider: row.try_get("storage_provider")?,
+            storage_destination_id: row.try_get("storage_destination_id")?,
+            storage_destination_revision: row.try_get("storage_destination_revision")?,
+            storage_allowed_host: row.try_get("storage_allowed_host")?,
+            storage_object_key_prefix: row.try_get("storage_object_key_prefix")?,
+            transient_delete_policy: row.try_get("transient_delete_policy")?,
+            operation_id: row.try_get("operation_id")?,
+            operation_generation: row.try_get("operation_generation")?,
+            operation_object_key: row.try_get("operation_object_key")?,
+        })
+    }
+}
+
+#[cfg(feature = "discord")]
+#[derive(Clone, Debug)]
+struct HostedArtifactManifest {
+    artifact_id: String,
+    segment_index: u32,
+    local_path: PathBuf,
+    content_length: u64,
+    sha256: String,
+}
 
 #[cfg(feature = "discord")]
 struct FinalizingRecordingGuard {
@@ -601,6 +696,7 @@ struct ActiveCapture {
     runtime_store: Option<SqlxRuntimeStore>,
     capture_mode: CaptureMode,
     hosted_usage: Option<(HostedControlPlaneClient, UsageReservation)>,
+    hosted_storage: Option<HostedStorageDestination>,
     hosted_generation: Option<u64>,
 }
 
@@ -1096,6 +1192,7 @@ WHERE command_id = $1 AND status = 'started'
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn persist_hosted_capture_recovery(
         &self,
         client: &HostedControlPlaneClient,
@@ -1104,6 +1201,7 @@ WHERE command_id = $1 AND status = 'started'
         base_wav_path: &Path,
         started_at: DateTime<Local>,
         owner_instance_id: &str,
+        destination: &HostedStorageDestination,
     ) -> Result<()> {
         let base_wav_path = base_wav_path
             .to_str()
@@ -1123,8 +1221,11 @@ WHERE command_id = $1 AND status = 'started'
             r#"
 INSERT INTO call_scribe_hosted_capture_recovery
     (reservation_id, encrypted_lease_token, encryption_nonce, recording_id,
-     base_wav_path, reserved_seconds, started_at, expires_at, owner_instance_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     base_wav_path, reserved_seconds, started_at, expires_at, owner_instance_id,
+     organization_id, guild_id, storage_provider, storage_destination_id,
+     storage_destination_revision, storage_allowed_host,
+     storage_object_key_prefix, transient_delete_policy)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 "#,
         )
         .bind(&reservation.reservation_id)
@@ -1136,6 +1237,14 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         .bind(started_at)
         .bind(expires_at)
         .bind(owner_instance_id)
+        .bind(&destination.organization_id)
+        .bind(&destination.guild_id)
+        .bind(&destination.provider)
+        .bind(&destination.destination_id)
+        .bind(&destination.destination_revision)
+        .bind(&destination.allowed_host)
+        .bind(&destination.object_key_prefix)
+        .bind(&destination.transient_delete_policy)
         .execute(&self.pool)
         .await
         .context("failed to persist hosted capture recovery state")?;
@@ -1206,6 +1315,7 @@ RETURNING expires_at
         Ok((recovery_claim_token, effective_authorization_end))
     }
 
+    #[cfg(test)]
     async fn remove_claimed_hosted_capture_recovery(
         &self,
         reservation_id: &str,
@@ -1339,7 +1449,11 @@ WHERE recovery.reservation_id = candidates.reservation_id
 RETURNING recovery.reservation_id, recovery.encrypted_lease_token,
           recovery.encryption_nonce, recovery.recording_id,
           recovery.base_wav_path, recovery.reserved_seconds,
-          recovery.started_at, recovery.expires_at
+          recovery.started_at, recovery.expires_at, recovery.organization_id,
+          recovery.guild_id, recovery.storage_provider,
+          recovery.storage_destination_id, recovery.storage_destination_revision,
+          recovery.storage_allowed_host, recovery.storage_object_key_prefix,
+          recovery.transient_delete_policy
 "#,
         )
         .bind(stale_before)
@@ -1394,6 +1508,14 @@ RETURNING reservation_id, recording_id
             reserved_seconds,
             started_at,
             expires_at,
+            organization_id,
+            guild_id,
+            storage_provider,
+            storage_destination_id,
+            storage_destination_revision,
+            storage_allowed_host,
+            storage_object_key_prefix,
+            transient_delete_policy,
         ) in recoveries
         {
             let recovery_result = async {
@@ -1414,31 +1536,59 @@ RETURNING reservation_id, recording_id
                     reserved_seconds,
                     expires_at: expires_at.to_rfc3339(),
                 };
+                let destination = HostedStorageDestination {
+                    organization_id,
+                    guild_id,
+                    provider: storage_provider,
+                    destination_id: storage_destination_id,
+                    destination_revision: storage_destination_revision,
+                    allowed_host: storage_allowed_host,
+                    object_key_prefix: storage_object_key_prefix,
+                    transient_delete_policy,
+                };
+                if destination.transient_delete_policy != "delete_after_verified_delivery"
+                    || !matches!(destination.provider.as_str(), "customer_s3" | "customer_r2")
+                {
+                    bail!("hosted recovery pinned an unsupported storage destination");
+                }
                 let actual_seconds =
                     recovered_usage_seconds(&base_wav_path, reserved_seconds)?.min(
                         authorized_usage_seconds(started_at, expires_at, reserved_seconds),
                     );
+                let wav_paths = checkpointed_wav_paths(&base_wav_path)?;
                 if actual_seconds == 0 {
                     client.release_usage(&reservation).await?;
-                } else {
-                    let occurred_at = started_at
-                        + chrono::Duration::seconds(
-                            i64::try_from(actual_seconds)
-                                .context("hosted recovery duration exceeded timestamp range")?,
-                        );
-                    self.enqueue_hosted_usage(
-                        client,
+                    self.finalize_zero_duration_hosted_capture_transaction(
                         &reservation,
                         &recording_id,
-                        actual_seconds,
-                        occurred_at,
+                        &recovery_claim_token,
+                        &destination,
+                        &wav_paths,
+                        Utc::now(),
                     )
                     .await?;
+                    if let Err(err) = self.finish_zero_duration_hosted_cleanup(capture_dir).await {
+                        eprintln!(
+                            "zero-duration hosted cleanup remains durably queued for recording {recording_id}: {err:#}"
+                        );
+                    }
+                    return Ok(());
                 }
-                self.remove_claimed_hosted_capture_recovery(
-                    &reservation_id,
+                let manifests = hosted_artifact_manifests(&wav_paths).await?;
+                let occurred_at = started_at
+                    + chrono::Duration::seconds(
+                        i64::try_from(actual_seconds)
+                            .context("hosted recovery duration exceeded timestamp range")?,
+                    );
+                self.finalize_hosted_capture_transaction(
+                    &reservation,
                     &recording_id,
                     &recovery_claim_token,
+                    actual_seconds,
+                    occurred_at,
+                    &destination,
+                    &manifests,
+                    Utc::now(),
                 )
                 .await
             }
@@ -1453,6 +1603,883 @@ RETURNING reservation_id, recording_id
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_hosted_capture_transaction(
+        &self,
+        reservation: &UsageReservation,
+        recording_id: &str,
+        recovery_claim_token: &str,
+        actual_seconds: u64,
+        occurred_at: DateTime<Utc>,
+        destination: &HostedStorageDestination,
+        manifests: &[HostedArtifactManifest],
+        stopped_at: DateTime<Utc>,
+    ) -> Result<()> {
+        if actual_seconds == 0 {
+            bail!("zero-duration hosted capture must not enter artifact delivery");
+        }
+        if manifests.is_empty() || manifests.len() > MAX_HOSTED_RECOVERY_WAV_SEGMENTS as usize {
+            bail!("hosted capture did not produce a bounded raw-audio manifest");
+        }
+        let actual_seconds = i64::try_from(actual_seconds)
+            .context("hosted usage duration exceeded database range")?;
+        let authorization_expires_at = DateTime::parse_from_rfc3339(&reservation.expires_at)
+            .context("hosted usage expiry was invalid")?
+            .with_timezone(&Utc);
+        if authorization_expires_at < occurred_at {
+            bail!("hosted usage exceeded its capture authority");
+        }
+        let expires_at = authorization_expires_at
+            + chrono::Duration::from_std(RESERVATION_SETTLEMENT_GRACE)
+                .expect("reservation settlement grace must fit chrono duration");
+        if expires_at <= Utc::now() {
+            bail!("hosted usage settlement window expired before it could be queued");
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin hosted finalization")?;
+        let recovery: HostedPinnedRecoveryRow = sqlx::query_as::query_as(
+            r#"
+SELECT encrypted_lease_token, encryption_nonce, organization_id, guild_id,
+       storage_provider, storage_destination_id, storage_destination_revision,
+       storage_allowed_host, storage_object_key_prefix, transient_delete_policy
+FROM call_scribe_hosted_capture_recovery
+WHERE reservation_id = $1
+  AND recording_id = $2
+  AND status = 'reconciling'
+  AND recovery_claim_token = $3
+FOR UPDATE
+"#,
+        )
+        .bind(&reservation.reservation_id)
+        .bind(recording_id)
+        .bind(recovery_claim_token)
+        .fetch_one(&mut *tx)
+        .await
+        .context("hosted finalization lost its recovery fence")?;
+        if recovery.2 != destination.organization_id
+            || recovery.3 != destination.guild_id
+            || recovery.4 != destination.provider
+            || recovery.5 != destination.destination_id
+            || recovery.6 != destination.destination_revision
+            || recovery.7 != destination.allowed_host
+            || recovery.8 != destination.object_key_prefix
+            || recovery.9 != destination.transient_delete_policy
+        {
+            bail!("hosted finalization destination differed from its pinned recovery snapshot");
+        }
+
+        let stopped = sqlx::query::query(
+            r#"
+UPDATE call_scribe_capture_sessions
+SET status = 'captured', stopped_at = $2, updated_at = now()
+WHERE id = $1 AND organization_id = $3
+"#,
+        )
+        .bind(recording_id)
+        .bind(stopped_at)
+        .bind(&destination.organization_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to persist hosted session stop")?;
+        if stopped.rows_affected() != 1 {
+            bail!("hosted capture session was missing during atomic finalization");
+        }
+        sqlx::query::query(
+            r#"
+INSERT INTO call_scribe_audit_events
+    (id, organization_id, session_id, event_type, actor_kind, guild_id, metadata)
+VALUES ($1, $2, $3, 'recording_stopped', 'system', $4,
+        '{"mode":"record_only","hosted":true}'::jsonb)
+"#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&destination.organization_id)
+        .bind(recording_id)
+        .bind(&destination.guild_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to persist hosted recording-stop evidence")?;
+
+        if actual_seconds > 0 {
+            let inserted = sqlx::query::query(
+                r#"
+INSERT INTO call_scribe_hosted_usage_outbox
+    (reservation_id, encrypted_lease_token, encryption_nonce, recording_id,
+     actual_seconds, occurred_at, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+ON CONFLICT (reservation_id) DO NOTHING
+"#,
+            )
+            .bind(&reservation.reservation_id)
+            .bind(&recovery.0)
+            .bind(&recovery.1)
+            .bind(recording_id)
+            .bind(actual_seconds)
+            .bind(occurred_at)
+            .bind(expires_at)
+            .execute(&mut *tx)
+            .await
+            .context("failed to durably enqueue hosted usage")?;
+            if inserted.rows_affected() == 0 {
+                let existing: (String, i64, DateTime<Utc>, DateTime<Utc>) =
+                    sqlx::query_as::query_as(
+                        r#"
+SELECT recording_id, actual_seconds, occurred_at, expires_at
+FROM call_scribe_hosted_usage_outbox
+WHERE reservation_id = $1
+"#,
+                    )
+                    .bind(&reservation.reservation_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .context("failed to verify existing hosted usage")?;
+                if existing
+                    != (
+                        recording_id.to_string(),
+                        actual_seconds,
+                        occurred_at,
+                        expires_at,
+                    )
+                {
+                    bail!("hosted reservation id was reused with different usage");
+                }
+            }
+        }
+
+        for manifest in manifests {
+            let segment_index = i32::try_from(manifest.segment_index)
+                .context("hosted segment index exceeded database range")?;
+            let content_length = i64::try_from(manifest.content_length)
+                .context("hosted artifact length exceeded database range")?;
+            let local_path = manifest
+                .local_path
+                .to_str()
+                .context("hosted artifact path was not valid UTF-8")?;
+            sqlx::query::query(
+                r#"
+INSERT INTO call_scribe_artifacts
+    (id, organization_id, session_id, kind, path, byte_size, metadata)
+VALUES ($1, $2, $3, 'raw_audio_wav', $4, $5, $6)
+"#,
+            )
+            .bind(&manifest.artifact_id)
+            .bind(&destination.organization_id)
+            .bind(recording_id)
+            .bind(local_path)
+            .bind(content_length)
+            .bind(serde_json::json!({
+                "segment_index": manifest.segment_index,
+                "sha256": &manifest.sha256,
+                "content_type": "audio/wav",
+                "hosted_delivery_state": "pending",
+            }))
+            .execute(&mut *tx)
+            .await
+            .context("failed to persist hosted raw-audio artifact")?;
+            sqlx::query::query(
+                r#"
+INSERT INTO call_scribe_hosted_artifact_delivery_outbox
+    (artifact_id, organization_id, guild_id, recording_id, reservation_id,
+     encrypted_lease_token, encryption_nonce, artifact_kind, segment_index,
+     local_path, content_length, sha256, content_type, storage_provider,
+     storage_destination_id, storage_destination_revision, storage_allowed_host,
+     storage_object_key_prefix, transient_delete_policy)
+VALUES ($1, $2, $3, $4, $5, $6, $7, 'raw_audio_wav', $8, $9, $10, $11,
+        'audio/wav', $12, $13, $14, $15, $16, $17)
+"#,
+            )
+            .bind(&manifest.artifact_id)
+            .bind(&destination.organization_id)
+            .bind(&destination.guild_id)
+            .bind(recording_id)
+            .bind(&reservation.reservation_id)
+            .bind(&recovery.0)
+            .bind(&recovery.1)
+            .bind(segment_index)
+            .bind(local_path)
+            .bind(content_length)
+            .bind(&manifest.sha256)
+            .bind(&destination.provider)
+            .bind(&destination.destination_id)
+            .bind(&destination.destination_revision)
+            .bind(&destination.allowed_host)
+            .bind(&destination.object_key_prefix)
+            .bind(&destination.transient_delete_policy)
+            .execute(&mut *tx)
+            .await
+            .context("failed to persist hosted artifact delivery job")?;
+            sqlx::query::query(
+                r#"
+INSERT INTO call_scribe_audit_events
+    (id, organization_id, session_id, event_type, actor_kind, guild_id, metadata)
+VALUES ($1, $2, $3, 'hosted_artifact_delivery_queued', 'system', $4, $5)
+"#,
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&destination.organization_id)
+            .bind(recording_id)
+            .bind(&destination.guild_id)
+            .bind(serde_json::json!({
+                "artifact_id": &manifest.artifact_id,
+                "artifact_kind": "raw_audio_wav",
+                "segment_index": manifest.segment_index,
+                "content_length": manifest.content_length,
+                "sha256": &manifest.sha256,
+                "storage_provider": &destination.provider,
+                "storage_destination_id": &destination.destination_id,
+                "storage_destination_revision": &destination.destination_revision,
+                "storage_allowed_host": &destination.allowed_host,
+                "storage_object_key_prefix": &destination.object_key_prefix,
+                "transient_delete_policy": &destination.transient_delete_policy,
+            }))
+            .execute(&mut *tx)
+            .await
+            .context("failed to persist hosted artifact delivery evidence")?;
+        }
+
+        let deleted = sqlx::query::query(
+            r#"
+DELETE FROM call_scribe_hosted_capture_recovery
+WHERE reservation_id = $1
+  AND recording_id = $2
+  AND status = 'reconciling'
+  AND recovery_claim_token = $3
+"#,
+        )
+        .bind(&reservation.reservation_id)
+        .bind(recording_id)
+        .bind(recovery_claim_token)
+        .execute(&mut *tx)
+        .await
+        .context("failed to clear atomically finalized hosted recovery")?;
+        if deleted.rows_affected() != 1 {
+            bail!("hosted finalization recovery fence was lost");
+        }
+        tx.commit()
+            .await
+            .context("failed to commit hosted finalization")?;
+        Ok(())
+    }
+
+    async fn finalize_zero_duration_hosted_capture_transaction(
+        &self,
+        reservation: &UsageReservation,
+        recording_id: &str,
+        recovery_claim_token: &str,
+        destination: &HostedStorageDestination,
+        cleanup_paths: &[PathBuf],
+        stopped_at: DateTime<Utc>,
+    ) -> Result<()> {
+        if cleanup_paths.is_empty()
+            || cleanup_paths.len() > MAX_HOSTED_RECOVERY_WAV_SEGMENTS as usize
+        {
+            bail!("zero-duration hosted capture had an invalid cleanup set");
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin zero-duration hosted finalization")?;
+        let recovery: (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = sqlx::query_as::query_as(
+            r#"
+SELECT organization_id, guild_id, storage_provider, storage_destination_id,
+       storage_destination_revision, storage_allowed_host,
+       storage_object_key_prefix, transient_delete_policy
+FROM call_scribe_hosted_capture_recovery
+WHERE reservation_id = $1
+  AND recording_id = $2
+  AND status = 'reconciling'
+  AND recovery_claim_token = $3
+FOR UPDATE
+"#,
+        )
+        .bind(&reservation.reservation_id)
+        .bind(recording_id)
+        .bind(recovery_claim_token)
+        .fetch_one(&mut *tx)
+        .await
+        .context("zero-duration finalization lost its recovery fence")?;
+        if recovery
+            != (
+                destination.organization_id.clone(),
+                destination.guild_id.clone(),
+                destination.provider.clone(),
+                destination.destination_id.clone(),
+                destination.destination_revision.clone(),
+                destination.allowed_host.clone(),
+                destination.object_key_prefix.clone(),
+                destination.transient_delete_policy.clone(),
+            )
+        {
+            bail!("zero-duration finalization destination differed from its pinned snapshot");
+        }
+
+        let stopped = sqlx::query::query(
+            r#"
+UPDATE call_scribe_capture_sessions
+SET status = 'captured', stopped_at = $2, updated_at = now()
+WHERE id = $1 AND organization_id = $3
+"#,
+        )
+        .bind(recording_id)
+        .bind(stopped_at)
+        .bind(&destination.organization_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to close zero-duration hosted session")?;
+        if stopped.rows_affected() != 1 {
+            bail!("zero-duration hosted session was missing during finalization");
+        }
+        sqlx::query::query(
+            r#"
+INSERT INTO call_scribe_audit_events
+    (id, organization_id, session_id, event_type, actor_kind, guild_id, metadata)
+VALUES ($1, $2, $3, 'recording_stopped', 'system', $4,
+        '{"mode":"record_only","hosted":true,"zero_duration":true}'::jsonb)
+"#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&destination.organization_id)
+        .bind(recording_id)
+        .bind(&destination.guild_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to persist zero-duration stop evidence")?;
+        for path in cleanup_paths {
+            let path = path
+                .to_str()
+                .context("zero-duration cleanup path was not valid UTF-8")?;
+            sqlx::query::query(
+                r#"
+INSERT INTO call_scribe_hosted_zero_duration_cleanup_outbox
+    (local_path, organization_id, recording_id)
+VALUES ($1, $2, $3)
+ON CONFLICT (local_path) DO NOTHING
+"#,
+            )
+            .bind(path)
+            .bind(&destination.organization_id)
+            .bind(recording_id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to queue zero-duration local cleanup")?;
+        }
+        let deleted = sqlx::query::query(
+            r#"
+DELETE FROM call_scribe_hosted_capture_recovery
+WHERE reservation_id = $1 AND recording_id = $2
+  AND status = 'reconciling' AND recovery_claim_token = $3
+"#,
+        )
+        .bind(&reservation.reservation_id)
+        .bind(recording_id)
+        .bind(recovery_claim_token)
+        .execute(&mut *tx)
+        .await
+        .context("failed to clear zero-duration recovery")?;
+        if deleted.rows_affected() != 1 {
+            bail!("zero-duration finalization recovery fence was lost");
+        }
+        tx.commit()
+            .await
+            .context("failed to commit zero-duration hosted finalization")?;
+        Ok(())
+    }
+
+    async fn finish_zero_duration_hosted_cleanup(&self, capture_dir: &Path) -> Result<()> {
+        let claim_token = Uuid::new_v4().to_string();
+        let rows: Vec<(String,)> = sqlx::query_as::query_as(
+            r#"
+WITH candidates AS (
+    SELECT local_path
+    FROM call_scribe_hosted_zero_duration_cleanup_outbox
+    WHERE next_attempt_at <= now()
+      AND (claim_token IS NULL OR claim_until <= now())
+    ORDER BY next_attempt_at, created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT 25
+)
+UPDATE call_scribe_hosted_zero_duration_cleanup_outbox AS cleanup
+SET claim_token = $1, claim_until = now() + interval '5 minutes',
+    attempt_count = attempt_count + 1, updated_at = now()
+FROM candidates
+WHERE cleanup.local_path = candidates.local_path
+RETURNING cleanup.local_path
+"#,
+        )
+        .bind(&claim_token)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to claim zero-duration cleanup")?;
+        for (local_path,) in rows {
+            let path = PathBuf::from(&local_path);
+            let cleanup_result = remove_zero_duration_wav(&path, capture_dir).await;
+            match cleanup_result {
+                Ok(()) => {
+                    sqlx::query::query(
+                        "DELETE FROM call_scribe_hosted_zero_duration_cleanup_outbox WHERE local_path = $1 AND claim_token = $2",
+                    )
+                    .bind(&local_path)
+                    .bind(&claim_token)
+                    .execute(&self.pool)
+                    .await
+                    .context("failed to complete zero-duration cleanup")?;
+                }
+                Err(err) => {
+                    let message: String = format!("{err:#}").chars().take(500).collect();
+                    sqlx::query::query(
+                        r#"
+UPDATE call_scribe_hosted_zero_duration_cleanup_outbox
+SET claim_token = NULL, claim_until = NULL,
+    next_attempt_at = now() + interval '30 seconds', last_error = $3, updated_at = now()
+WHERE local_path = $1 AND claim_token = $2
+"#,
+                    )
+                    .bind(&local_path)
+                    .bind(&claim_token)
+                    .bind(message)
+                    .execute(&self.pool)
+                    .await
+                    .context("failed to defer zero-duration cleanup")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn has_unsafe_hosted_deliveries(
+        &self,
+        organization_id: &str,
+        guild_id: &str,
+        maximum_age: Duration,
+    ) -> Result<bool> {
+        let maximum_age = chrono::Duration::from_std(maximum_age)
+            .context("hosted delivery backpressure age exceeded timestamp range")?;
+        let unsafe_before = Utc::now() - maximum_age;
+        sqlx::query_scalar::query_scalar(
+            r#"
+SELECT EXISTS (
+    SELECT 1
+    FROM call_scribe_hosted_artifact_delivery_outbox
+    WHERE organization_id = $1
+      AND guild_id = $2
+      AND status <> 'delivered'
+      AND created_at <= $3
+)
+"#,
+        )
+        .bind(organization_id)
+        .bind(guild_id)
+        .bind(unsafe_before)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to check hosted delivery backpressure")
+    }
+
+    async fn retry_hosted_artifact_delivery_outbox(
+        &self,
+        client: &HostedControlPlaneClient,
+        capture_dir: &Path,
+        claim_owner: &str,
+    ) -> Result<()> {
+        self.finish_zero_duration_hosted_cleanup(capture_dir)
+            .await?;
+        sqlx::query::query(
+            r#"
+UPDATE call_scribe_hosted_artifact_delivery_outbox
+SET status = 'failed', encrypted_lease_token = NULL, encryption_nonce = NULL,
+    claim_owner = NULL, claim_token = NULL, claim_until = NULL,
+    last_error = 'hosted artifact delivery exhausted its retry budget', updated_at = now()
+WHERE status IN ('pending', 'in_progress')
+  AND attempt_count >= $1
+  AND (status = 'pending' OR claim_until <= now())
+"#,
+        )
+        .bind(HOSTED_DELIVERY_MAX_ATTEMPTS)
+        .execute(&self.pool)
+        .await
+        .context("failed to terminally fence exhausted hosted deliveries")?;
+
+        self.finish_verified_hosted_artifact_deletions(capture_dir)
+            .await?;
+
+        let claim_token = Uuid::new_v4().to_string();
+        let claim_seconds = i64::try_from(HOSTED_DELIVERY_CLAIM_TTL.as_secs())
+            .expect("hosted delivery claim TTL must fit i64");
+        let jobs: Vec<HostedArtifactDeliveryRow> = sqlx::query_as::query_as(
+            r#"
+WITH candidates AS (
+    SELECT artifact_id
+    FROM call_scribe_hosted_artifact_delivery_outbox
+    WHERE (status = 'pending' OR (status = 'in_progress' AND claim_until <= now()))
+      AND next_attempt_at <= now()
+      AND attempt_count < $1
+    ORDER BY next_attempt_at, created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT 10
+)
+UPDATE call_scribe_hosted_artifact_delivery_outbox AS delivery
+SET status = 'in_progress', claim_owner = $2, claim_token = $3,
+    claim_until = now() + ($4 * interval '1 second'),
+    attempt_count = attempt_count + 1,
+    first_attempt_at = COALESCE(first_attempt_at, now()),
+    updated_at = now()
+FROM candidates
+WHERE delivery.artifact_id = candidates.artifact_id
+RETURNING delivery.artifact_id, delivery.recording_id, delivery.reservation_id,
+          delivery.encrypted_lease_token, delivery.encryption_nonce,
+          delivery.segment_index, delivery.local_path,
+          delivery.content_length, delivery.sha256,
+          delivery.storage_provider, delivery.storage_destination_id,
+          delivery.storage_destination_revision, delivery.storage_allowed_host,
+          delivery.storage_object_key_prefix, delivery.transient_delete_policy,
+          delivery.operation_id,
+          delivery.operation_generation, delivery.operation_object_key
+"#,
+        )
+        .bind(HOSTED_DELIVERY_MAX_ATTEMPTS)
+        .bind(claim_owner)
+        .bind(&claim_token)
+        .bind(claim_seconds)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to claim hosted artifact deliveries")?;
+
+        for job in jobs {
+            let artifact_id = job.artifact_id.clone();
+            if let Err(err) = self
+                .deliver_claimed_hosted_artifact(client, capture_dir, &claim_token, job)
+                .await
+            {
+                eprintln!("hosted artifact {artifact_id} delivery remains pending: {err:#}");
+                self.defer_claimed_hosted_artifact(&artifact_id, &claim_token, &err)
+                    .await?;
+            }
+        }
+        self.finish_verified_hosted_artifact_deletions(capture_dir)
+            .await
+    }
+
+    async fn deliver_claimed_hosted_artifact(
+        &self,
+        client: &HostedControlPlaneClient,
+        capture_dir: &Path,
+        claim_token: &str,
+        job: HostedArtifactDeliveryRow,
+    ) -> Result<()> {
+        let HostedArtifactDeliveryRow {
+            artifact_id,
+            recording_id,
+            reservation_id,
+            encrypted_lease_token,
+            encryption_nonce,
+            segment_index,
+            local_path,
+            content_length,
+            sha256,
+            storage_provider,
+            storage_destination_id: destination_id,
+            storage_destination_revision: destination_revision,
+            storage_allowed_host: allowed_host,
+            storage_object_key_prefix: object_key_prefix,
+            transient_delete_policy,
+            operation_id: persisted_operation_id,
+            operation_generation: persisted_operation_generation,
+            operation_object_key: persisted_operation_object_key,
+        } = job;
+        let local_path = PathBuf::from(local_path);
+        if !local_path.starts_with(capture_dir) {
+            bail!("hosted delivery artifact escaped the configured capture directory");
+        }
+        let lease_token = client.decrypt_reservation_lease(
+            &reservation_id,
+            &encrypted_lease_token,
+            &encryption_nonce,
+        )?;
+        let content_length =
+            u64::try_from(content_length).context("hosted artifact length was invalid")?;
+        let segment_index =
+            u32::try_from(segment_index).context("hosted artifact segment index was invalid")?;
+        let destination = HostedStorageDestination {
+            // Organization and guild are not sent to the prepare endpoint; the
+            // control plane derives them from reservation authority.
+            organization_id: String::new(),
+            guild_id: String::new(),
+            provider: storage_provider,
+            destination_id,
+            destination_revision,
+            allowed_host,
+            object_key_prefix,
+            transient_delete_policy,
+        };
+        if destination.transient_delete_policy != "delete_after_verified_delivery" {
+            bail!("hosted artifact had an unsupported transient deletion policy");
+        }
+        let request = ArtifactDeliveryPrepareRequest {
+            reservation_id: &reservation_id,
+            lease_token: &lease_token,
+            recording_id: &recording_id,
+            artifact_id: &artifact_id,
+            artifact_kind: "raw_audio_wav",
+            segment_index,
+            content_length,
+            sha256: &sha256,
+            content_type: "audio/wav",
+        };
+        let persisted_operation = match (
+            persisted_operation_id,
+            persisted_operation_generation,
+            persisted_operation_object_key,
+        ) {
+            (Some(operation_id), Some(generation), Some(object_key)) => {
+                Some(ArtifactDeliveryOperationRef {
+                    operation_id,
+                    generation: u64::try_from(generation)
+                        .context("persisted hosted delivery generation was invalid")?,
+                    recording_id: recording_id.clone(),
+                    artifact_id: artifact_id.clone(),
+                    artifact_kind: "raw_audio_wav".to_string(),
+                    segment_index,
+                    object_key,
+                    destination_id: destination.destination_id.clone(),
+                    destination_revision: destination.destination_revision.clone(),
+                    provider: destination.provider.clone(),
+                    allowed_upload_host: destination.allowed_host.clone(),
+                })
+            }
+            (None, None, None) => None,
+            _ => bail!("hosted delivery persisted only part of its operation fence"),
+        };
+        if let Some(operation) = &persisted_operation
+            && let ArtifactDeliveryVerification::Verified(receipt) = client
+                .verify_artifact_delivery(operation, &request, &destination)
+                .await?
+        {
+            return self
+                .mark_hosted_artifact_verified(&artifact_id, claim_token, operation, &receipt)
+                .await;
+        }
+
+        let prepared = client
+            .prepare_artifact_delivery(&request, &destination)
+            .await?;
+        let operation = ArtifactDeliveryOperationRef::from(&prepared);
+        if let Some(persisted) = &persisted_operation
+            && operation != *persisted
+        {
+            bail!("hosted control plane replaced an already-persisted delivery operation");
+        }
+        let generation = i64::try_from(operation.generation)
+            .context("hosted delivery generation exceeded database range")?;
+        let persisted = sqlx::query::query(
+            r#"
+UPDATE call_scribe_hosted_artifact_delivery_outbox
+SET operation_id = $3, operation_generation = $4, operation_object_key = $5,
+    updated_at = now()
+WHERE artifact_id = $1 AND status = 'in_progress' AND claim_token = $2
+  AND (operation_id IS NULL OR (operation_id = $3 AND operation_generation = $4
+       AND operation_object_key = $5))
+"#,
+        )
+        .bind(&artifact_id)
+        .bind(claim_token)
+        .bind(&operation.operation_id)
+        .bind(generation)
+        .bind(&operation.object_key)
+        .execute(&self.pool)
+        .await
+        .context("failed to persist hosted delivery operation fence")?;
+        if persisted.rows_affected() != 1 {
+            bail!("hosted artifact delivery claim fence was lost before upload");
+        }
+        client
+            .upload_artifact(&prepared, &request, &local_path, &destination)
+            .await?;
+        let receipt = client
+            .verify_artifact_delivery(&operation, &request, &destination)
+            .await?;
+        match receipt {
+            ArtifactDeliveryVerification::Verified(receipt) => {
+                self.mark_hosted_artifact_verified(&artifact_id, claim_token, &operation, &receipt)
+                    .await
+            }
+            ArtifactDeliveryVerification::NotReady => {
+                bail!("control plane could not independently verify the uploaded artifact")
+            }
+        }
+    }
+
+    async fn mark_hosted_artifact_verified(
+        &self,
+        artifact_id: &str,
+        claim_token: &str,
+        operation: &ArtifactDeliveryOperationRef,
+        receipt: &ArtifactDeliveryReceipt,
+    ) -> Result<()> {
+        let verified_at = receipt.verified_at;
+        let receipt_json =
+            serde_json::to_value(receipt).context("failed to encode delivery receipt")?;
+        let verified = sqlx::query::query(
+            r#"
+UPDATE call_scribe_hosted_artifact_delivery_outbox
+SET status = 'verified', encrypted_lease_token = NULL, encryption_nonce = NULL,
+    receipt = $3, verified_at = $4, claim_owner = NULL, claim_token = NULL,
+    claim_until = NULL, last_error = NULL, updated_at = now()
+WHERE artifact_id = $1 AND status = 'in_progress' AND claim_token = $2
+  AND operation_id = $5 AND operation_generation = $6
+"#,
+        )
+        .bind(artifact_id)
+        .bind(claim_token)
+        .bind(receipt_json)
+        .bind(verified_at)
+        .bind(&operation.operation_id)
+        .bind(i64::try_from(operation.generation).context("delivery generation overflowed")?)
+        .execute(&self.pool)
+        .await
+        .context("failed to persist verified hosted delivery receipt")?;
+        if verified.rows_affected() != 1 {
+            bail!("hosted artifact delivery claim fence was lost before verification");
+        }
+        Ok(())
+    }
+
+    async fn defer_claimed_hosted_artifact(
+        &self,
+        artifact_id: &str,
+        claim_token: &str,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        let message: String = format!("{error:#}").chars().take(500).collect();
+        let deferred = sqlx::query::query(
+            r#"
+UPDATE call_scribe_hosted_artifact_delivery_outbox
+SET status = 'pending', claim_owner = NULL, claim_token = NULL, claim_until = NULL,
+    next_attempt_at = now() + interval '30 seconds', last_error = $3, updated_at = now()
+WHERE artifact_id = $1 AND status = 'in_progress' AND claim_token = $2
+"#,
+        )
+        .bind(artifact_id)
+        .bind(claim_token)
+        .bind(message)
+        .execute(&self.pool)
+        .await
+        .context("failed to defer hosted artifact delivery")?;
+        if deferred.rows_affected() != 1 {
+            bail!("hosted artifact delivery claim fence was lost before retry");
+        }
+        Ok(())
+    }
+
+    async fn finish_verified_hosted_artifact_deletions(&self, capture_dir: &Path) -> Result<()> {
+        let deletion_owner = Uuid::new_v4().to_string();
+        let deletion_claim_token = Uuid::new_v4().to_string();
+        let verified: Vec<(String, String)> = sqlx::query_as::query_as(
+            r#"
+WITH candidates AS (
+    SELECT artifact_id
+    FROM call_scribe_hosted_artifact_delivery_outbox
+    WHERE status = 'verified'
+    ORDER BY verified_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT 25
+)
+UPDATE call_scribe_hosted_artifact_delivery_outbox AS delivery
+SET claim_owner = $1, claim_token = $2, claim_until = now() + interval '5 minutes',
+    updated_at = now()
+FROM candidates
+WHERE delivery.artifact_id = candidates.artifact_id
+RETURNING delivery.artifact_id, delivery.local_path
+"#,
+        )
+        .bind(&deletion_owner)
+        .bind(&deletion_claim_token)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list verified hosted artifact deletions")?;
+        for (artifact_id, local_path) in verified {
+            let local_path = PathBuf::from(local_path);
+            if !local_path.starts_with(capture_dir) {
+                eprintln!(
+                    "hosted artifact {artifact_id} deletion denied outside capture directory"
+                );
+                self.release_verified_deletion_claim(&artifact_id, &deletion_claim_token)
+                    .await?;
+                continue;
+            }
+            match tokio::fs::remove_file(&local_path).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    eprintln!(
+                        "hosted artifact {artifact_id} local deletion remains pending: {err}"
+                    );
+                    self.release_verified_deletion_claim(&artifact_id, &deletion_claim_token)
+                        .await?;
+                    continue;
+                }
+            }
+            sqlx::query::query(
+                r#"
+UPDATE call_scribe_hosted_artifact_delivery_outbox
+SET status = 'delivered', local_deleted_at = now(), completed_at = now(),
+    claim_owner = NULL, claim_token = NULL, claim_until = NULL, updated_at = now()
+WHERE artifact_id = $1 AND status = 'verified' AND claim_token = $2
+"#,
+            )
+            .bind(&artifact_id)
+            .bind(&deletion_claim_token)
+            .execute(&self.pool)
+            .await
+            .context("failed to mark hosted artifact delivery complete")?;
+            sqlx::query::query(
+                r#"
+UPDATE call_scribe_artifacts
+SET metadata = metadata || '{"hosted_delivery_state":"delivered","local_deleted":true}'::jsonb
+WHERE id = $1
+"#,
+            )
+            .bind(&artifact_id)
+            .execute(&self.pool)
+            .await
+            .context("failed to update hosted artifact delivery metadata")?;
+        }
+        Ok(())
+    }
+
+    async fn release_verified_deletion_claim(
+        &self,
+        artifact_id: &str,
+        claim_token: &str,
+    ) -> Result<()> {
+        sqlx::query::query(
+            r#"
+UPDATE call_scribe_hosted_artifact_delivery_outbox
+SET claim_owner = NULL, claim_token = NULL, claim_until = NULL, updated_at = now()
+WHERE artifact_id = $1 AND status = 'verified' AND claim_token = $2
+"#,
+        )
+        .bind(artifact_id)
+        .bind(claim_token)
+        .execute(&self.pool)
+        .await
+        .context("failed to release hosted artifact deletion claim")?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     async fn enqueue_hosted_usage(
         &self,
         client: &HostedControlPlaneClient,
@@ -1472,18 +2499,14 @@ RETURNING reservation_id, recording_id
         let expires_at = authorization_expires_at
             + chrono::Duration::from_std(RESERVATION_SETTLEMENT_GRACE)
                 .expect("reservation settlement grace must fit chrono duration");
-        if expires_at <= Utc::now() {
-            bail!("hosted usage settlement window expired before it could be queued");
-        }
         let (encrypted_lease_token, encryption_nonce) = client
             .encrypt_reservation_lease(&reservation.reservation_id, &reservation.lease_token)?;
-        let inserted = sqlx::query::query(
+        sqlx::query::query(
             r#"
 INSERT INTO call_scribe_hosted_usage_outbox
     (reservation_id, encrypted_lease_token, encryption_nonce, recording_id,
      actual_seconds, occurred_at, expires_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
-ON CONFLICT (reservation_id) DO NOTHING
 "#,
         )
         .bind(&reservation.reservation_id)
@@ -1496,31 +2519,6 @@ ON CONFLICT (reservation_id) DO NOTHING
         .execute(&self.pool)
         .await
         .context("failed to enqueue hosted usage reconciliation")?;
-        if inserted.rows_affected() == 1 {
-            return Ok(());
-        }
-
-        let existing: (String, i64, DateTime<Utc>, DateTime<Utc>) = sqlx::query_as::query_as(
-            r#"
-SELECT recording_id, actual_seconds, occurred_at, expires_at
-FROM call_scribe_hosted_usage_outbox
-WHERE reservation_id = $1
-"#,
-        )
-        .bind(&reservation.reservation_id)
-        .fetch_one(&self.pool)
-        .await
-        .context("failed to verify existing hosted usage reconciliation")?;
-        if existing
-            != (
-                recording_id.to_string(),
-                actual_seconds,
-                occurred_at,
-                expires_at,
-            )
-        {
-            bail!("hosted reservation id was reused with different usage");
-        }
         Ok(())
     }
 
@@ -1670,6 +2668,7 @@ struct SegmentedWavRecorder {
     paths: Vec<PathBuf>,
     writer: hound::WavWriter<BufWriter<File>>,
     data_bytes_written: u32,
+    capture_source_stems: bool,
     source_paths: HashMap<u32, PathBuf>,
     source_writers: HashMap<u32, hound::WavWriter<BufWriter<File>>>,
 }
@@ -2471,51 +3470,72 @@ impl DiscordCaptureHandler {
     ) -> Result<()> {
         self.stop_capture(ctx, guild_id).await?;
 
-        let (organization_id, capture_mode, hosted_generation, hosted_reservation_request) =
-            if let Some(hosted) = &self.config.hosted {
-                let policy = hosted
-                    .configurations
-                    .policy_for(guild_id.get())
-                    .context("hosted configuration is missing or stale")?;
-                if !policy.permits_recording(channel_id.get()) {
-                    bail!("hosted configuration does not authorize this guild and channel");
-                }
-                let requested = self
-                    .requested_channels
-                    .get(&guild_id)
-                    .map(|requested| requested.clone())
-                    .context("hosted start has no durable requested state")?;
-                if requested.channel_id != channel_id
-                    || requested.generation != policy.desired_recording_generation
-                {
-                    bail!("hosted start generation does not match current desired state");
-                }
-                let requested_seconds = policy
-                    .remaining_recording_seconds
-                    .context("hosted remaining usage is not configured")?
-                    .min(3_600);
-                (
-                    policy.organization_id,
-                    CaptureMode::RecordOnly,
-                    Some(requested.generation),
-                    Some((
-                        hosted.client.clone(),
-                        requested.command_id,
-                        requested_seconds,
-                    )),
-                )
-            } else {
-                (
-                    self.config.self_hosted_organization_id.clone(),
-                    self.config.self_hosted_capture_mode,
-                    None,
-                    None,
-                )
-            };
+        let (
+            organization_id,
+            capture_mode,
+            hosted_generation,
+            hosted_reservation_request,
+            hosted_storage,
+        ) = if let Some(hosted) = &self.config.hosted {
+            let policy = hosted
+                .configurations
+                .policy_for(guild_id.get())
+                .context("hosted configuration is missing or stale")?;
+            if !policy.permits_recording(channel_id.get()) {
+                bail!("hosted configuration does not authorize this guild and channel");
+            }
+            let requested = self
+                .requested_channels
+                .get(&guild_id)
+                .map(|requested| requested.clone())
+                .context("hosted start has no durable requested state")?;
+            if requested.channel_id != channel_id
+                || requested.generation != policy.desired_recording_generation
+            {
+                bail!("hosted start generation does not match current desired state");
+            }
+            let requested_seconds = policy
+                .remaining_recording_seconds
+                .context("hosted remaining usage is not configured")?
+                .min(3_600);
+            let destination = policy
+                .storage_destination()
+                .context("hosted storage destination is incomplete or unsupported")?;
+            (
+                policy.organization_id.clone(),
+                CaptureMode::RecordOnly,
+                Some(requested.generation),
+                Some((
+                    hosted.client.clone(),
+                    requested.command_id,
+                    requested_seconds,
+                )),
+                Some(destination),
+            )
+        } else {
+            (
+                self.config.self_hosted_organization_id.clone(),
+                self.config.self_hosted_capture_mode,
+                None,
+                None,
+                None,
+            )
+        };
         let runtime_store = match &self.config.runtime_store {
             Some(store) => Some(store.scoped(organization_id, capture_mode).await?),
             None => None,
         };
+        if let (Some(store), Some(destination)) = (&runtime_store, &hosted_storage)
+            && store
+                .has_unsafe_hosted_deliveries(
+                    &destination.organization_id,
+                    &destination.guild_id,
+                    HOSTED_DELIVERY_BACKPRESSURE_AGE,
+                )
+                .await?
+        {
+            bail!("hosted recording is backpressured by an overdue unsafe local artifact delivery");
+        }
 
         let session_id = Uuid::new_v4().to_string();
         let started_at = Local::now();
@@ -2527,7 +3547,10 @@ impl DiscordCaptureHandler {
             channel_id.get(),
             session_id,
         ));
-        let recorder = create_wav_recorder(&base_wav_path)?;
+        // Hosted delivery intentionally records only the mixed artifact. This
+        // makes the durable manifest exhaustive and prevents participant stems
+        // from falling outside delivery, deletion, and retention accounting.
+        let recorder = create_wav_recorder(&base_wav_path, hosted_storage.is_none())?;
         let known_ssrcs = Arc::new(DashMap::new());
         let voice_stats = Arc::new(DiscordVoiceStats::default());
         let manager = songbird::get(ctx)
@@ -2571,6 +3594,9 @@ impl DiscordCaptureHandler {
                     &base_wav_path,
                     started_at,
                     &self.recovery_owner_id,
+                    hosted_storage
+                        .as_ref()
+                        .context("hosted capture omitted its pinned storage destination")?,
                 )
                 .await
             {
@@ -2791,6 +3817,7 @@ impl DiscordCaptureHandler {
                 runtime_store,
                 capture_mode,
                 hosted_usage,
+                hosted_storage,
                 hosted_generation,
             },
         );
@@ -2887,38 +3914,75 @@ impl DiscordCaptureHandler {
                     .release_usage(&settlement_reservation)
                     .await
                     .context("failed to release zero-duration hosted capture")?;
+                let destination = active
+                    .hosted_storage
+                    .as_ref()
+                    .context("hosted capture omitted its pinned storage destination")?;
+                store
+                    .finalize_zero_duration_hosted_capture_transaction(
+                        &settlement_reservation,
+                        &active.session_id,
+                        &recovery_claim_token,
+                        destination,
+                        &wav_paths,
+                        stopped_at.with_timezone(&Utc),
+                    )
+                    .await
+                    .context("failed to finalize zero-duration hosted capture")?;
+                if let Err(err) = store
+                    .finish_zero_duration_hosted_cleanup(&self.config.capture_dir)
+                    .await
+                {
+                    eprintln!(
+                        "zero-duration hosted cleanup remains durably queued for recording {}: {err:#}",
+                        active.session_id
+                    );
+                }
             } else {
+                let manifests = hosted_artifact_manifests(&wav_paths).await?;
                 let occurred_at = active.started_at.with_timezone(&Utc)
                     + chrono::Duration::seconds(
                         i64::try_from(actual_seconds)
                             .context("hosted usage duration exceeded timestamp range")?,
                     );
+                let destination = active
+                    .hosted_storage
+                    .as_ref()
+                    .context("hosted capture omitted its pinned storage destination")?;
                 store
-                    .enqueue_hosted_usage(
-                        client,
+                    .finalize_hosted_capture_transaction(
                         &settlement_reservation,
                         &active.session_id,
+                        &recovery_claim_token,
                         actual_seconds,
                         occurred_at,
+                        destination,
+                        &manifests,
+                        stopped_at.with_timezone(&Utc),
                     )
                     .await
-                    .context("failed to durably enqueue hosted usage")?;
+                    .context("failed to atomically finalize hosted artifacts and delivery jobs")?;
             }
-            store
-                .remove_claimed_hosted_capture_recovery(
-                    &reservation.reservation_id,
-                    &active.session_id,
-                    &recovery_claim_token,
-                )
-                .await?;
             if let Err(err) = store.retry_hosted_usage_outbox(client).await {
                 eprintln!(
                     "hosted usage for recording {} remains queued for retry: {err:#}",
                     active.session_id
                 );
             }
-        }
-        if let Some(store) = &active.runtime_store {
+            if let Err(err) = store
+                .retry_hosted_artifact_delivery_outbox(
+                    client,
+                    &self.config.capture_dir,
+                    &self.recovery_owner_id,
+                )
+                .await
+            {
+                eprintln!(
+                    "hosted artifacts for recording {} remain queued for retry: {err:#}",
+                    active.session_id
+                );
+            }
+        } else if let Some(store) = &active.runtime_store {
             if let Err(err) = store
                 .record_session_stopped(&active.session_id, stopped_at)
                 .await
@@ -3209,6 +4273,16 @@ impl DiscordCaptureHandler {
                 }
                 if let Err(err) = store.retry_hosted_usage_outbox(&hosted.client).await {
                     eprintln!("hosted usage outbox retry failed: {err:#}");
+                }
+                if let Err(err) = store
+                    .retry_hosted_artifact_delivery_outbox(
+                        &hosted.client,
+                        &self.config.capture_dir,
+                        &self.recovery_owner_id,
+                    )
+                    .await
+                {
+                    eprintln!("hosted artifact delivery retry failed: {err:#}");
                 }
             }
 
@@ -3750,8 +4824,8 @@ impl DiscordVoiceStats {
 }
 
 #[cfg(feature = "discord")]
-fn create_wav_recorder(path: &Path) -> Result<SharedWavRecorder> {
-    let recorder = SegmentedWavRecorder::new(path)?;
+fn create_wav_recorder(path: &Path, capture_source_stems: bool) -> Result<SharedWavRecorder> {
+    let recorder = SegmentedWavRecorder::new(path, capture_source_stems)?;
     Ok(Arc::new(Mutex::new(Some(recorder))))
 }
 
@@ -3822,6 +4896,36 @@ fn recovered_usage_seconds(base_path: &Path, reserved_seconds: u64) -> Result<u6
 }
 
 #[cfg(feature = "discord")]
+async fn remove_zero_duration_wav(path: &Path, capture_dir: &Path) -> Result<()> {
+    if !path.starts_with(capture_dir) {
+        bail!("zero-duration cleanup escaped the configured capture directory");
+    }
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).context("failed to inspect zero-duration cleanup path"),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("zero-duration cleanup target was not a regular worker-owned file");
+    }
+    let owned_path = path.to_path_buf();
+    let duration = tokio::task::spawn_blocking(move || {
+        let reader = hound::WavReader::open(&owned_path)
+            .with_context(|| format!("failed to read cleanup WAV {}", owned_path.display()))?;
+        Ok::<_, anyhow::Error>(reader.duration())
+    })
+    .await
+    .context("zero-duration WAV validation task failed")??;
+    if duration != 0 {
+        bail!("zero-duration cleanup refused to delete a WAV containing audio samples");
+    }
+    tokio::fs::remove_file(path)
+        .await
+        .with_context(|| format!("failed to remove zero-duration WAV {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(feature = "discord")]
 fn authorized_usage_seconds(
     started_at: DateTime<Utc>,
     authorization_ended_at: DateTime<Utc>,
@@ -3846,8 +4950,58 @@ fn hosted_authority_requires_fence(expires_at: DateTime<Utc>, now: DateTime<Utc>
 }
 
 #[cfg(feature = "discord")]
+async fn hosted_artifact_manifests(paths: &[PathBuf]) -> Result<Vec<HostedArtifactManifest>> {
+    if paths.is_empty() || paths.len() > MAX_HOSTED_RECOVERY_WAV_SEGMENTS as usize {
+        bail!("hosted raw-audio artifact count was outside the supported bound");
+    }
+    let paths = paths.to_vec();
+    tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let symlink_metadata = std::fs::symlink_metadata(&path).with_context(|| {
+                    format!("failed to inspect hosted artifact {}", path.display())
+                })?;
+                if symlink_metadata.file_type().is_symlink() || !symlink_metadata.is_file() {
+                    bail!("hosted artifact was not a regular worker-owned file");
+                }
+                let content_length = symlink_metadata.len();
+                if content_length == 0 {
+                    bail!("hosted artifact was empty");
+                }
+                let mut file = File::open(&path).with_context(|| {
+                    format!("failed to open hosted artifact {}", path.display())
+                })?;
+                let mut digest = Sha256::new();
+                let mut buffer = vec![0_u8; 1024 * 1024];
+                loop {
+                    let read = file.read(&mut buffer).with_context(|| {
+                        format!("failed to hash hosted artifact {}", path.display())
+                    })?;
+                    if read == 0 {
+                        break;
+                    }
+                    digest.update(&buffer[..read]);
+                }
+                Ok(HostedArtifactManifest {
+                    artifact_id: Uuid::new_v4().to_string(),
+                    segment_index: u32::try_from(index + 1)
+                        .context("hosted segment index exceeded u32")?,
+                    local_path: path,
+                    content_length,
+                    sha256: format!("{:x}", digest.finalize()),
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+    })
+    .await
+    .context("hosted artifact hashing task failed")?
+}
+
+#[cfg(feature = "discord")]
 impl SegmentedWavRecorder {
-    fn new(base_path: &Path) -> Result<Self> {
+    fn new(base_path: &Path, capture_source_stems: bool) -> Result<Self> {
         let writer = hound::WavWriter::create(base_path, discord_wav_spec())
             .with_context(|| format!("failed to create {}", base_path.display()))?;
         Ok(Self {
@@ -3856,6 +5010,7 @@ impl SegmentedWavRecorder {
             paths: vec![base_path.to_path_buf()],
             writer,
             data_bytes_written: 0,
+            capture_source_stems,
             source_paths: HashMap::new(),
             source_writers: HashMap::new(),
         })
@@ -3873,19 +5028,21 @@ impl SegmentedWavRecorder {
             self.write_sample(clamped as i16)?;
         }
 
-        for (ssrc, _) in source_frames {
-            self.ensure_source_writer(*ssrc)?;
-        }
+        if self.capture_source_stems {
+            for (ssrc, _) in source_frames {
+                self.ensure_source_writer(*ssrc)?;
+            }
 
-        let source_by_ssrc: HashMap<u32, &[i16]> = source_frames.iter().copied().collect();
-        for (ssrc, source_writer) in &mut self.source_writers {
-            let source_samples = source_by_ssrc.get(ssrc).copied();
-            for idx in 0..frame_sample_count {
-                let sample = source_samples
-                    .and_then(|samples| samples.get(idx))
-                    .copied()
-                    .unwrap_or_default();
-                source_writer.write_sample(sample)?;
+            let source_by_ssrc: HashMap<u32, &[i16]> = source_frames.iter().copied().collect();
+            for (ssrc, source_writer) in &mut self.source_writers {
+                let source_samples = source_by_ssrc.get(ssrc).copied();
+                for idx in 0..frame_sample_count {
+                    let sample = source_samples
+                        .and_then(|samples| samples.get(idx))
+                        .copied()
+                        .unwrap_or_default();
+                    source_writer.write_sample(sample)?;
+                }
             }
         }
 
@@ -4911,6 +6068,11 @@ mod tests {
                 remaining_recording_seconds: Some(300),
                 storage_provider: Some("customer_s3".to_string()),
                 storage_destination_label: Some("worker-pvc".to_string()),
+                storage_destination_id: Some("dst_01".to_string()),
+                storage_destination_revision: Some("rev_01".to_string()),
+                storage_allowed_host: Some("bucket.s3.us-east-1.amazonaws.com".to_string()),
+                storage_object_key_prefix: Some("objects/".to_string()),
+                transient_delete_policy: Some("delete_after_verified_delivery".to_string()),
                 ready: true,
                 blocked_reasons: Vec::new(),
                 desired_recording_generation: 1,
@@ -5041,7 +6203,7 @@ mod tests {
 
     #[cfg(feature = "discord")]
     #[test]
-    fn hosted_mode_stays_closed_after_command_until_storage_adapter_exists() {
+    fn hosted_mode_opens_only_after_durable_command_and_complete_storage_contract() {
         let guild_id = GuildId::new(1);
         let channel_id = ChannelId::new(2);
         let participant_user_id = UserId::new(4);
@@ -5059,7 +6221,7 @@ mod tests {
                 command_id: "cmd-1".to_string(),
             },
         );
-        assert_eq!(handler.desired_capture_channel(guild_id), None);
+        assert_eq!(handler.desired_capture_channel(guild_id), Some(channel_id));
     }
 
     #[cfg(feature = "discord")]
@@ -5109,6 +6271,29 @@ mod tests {
         );
 
         assert_eq!(handler.desired_capture_channel(guild_id), None);
+    }
+
+    #[cfg(feature = "discord")]
+    #[test]
+    fn hosted_recorder_disables_untracked_participant_stems() -> Result<()> {
+        let test_dir = std::env::temp_dir().join(format!("call-scribe-stems-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir)?;
+        let hosted_path = test_dir.join("hosted.wav");
+        let mut hosted = SegmentedWavRecorder::new(&hosted_path, false)?;
+        hosted.write_tick(&[1, 1], &[(42, &[1, 1])], 2)?;
+        hosted.finalize()?;
+        assert!(!source_wav_path(&hosted_path, 42).exists());
+
+        let self_hosted_path = test_dir.join("self-hosted.wav");
+        let mut self_hosted = SegmentedWavRecorder::new(&self_hosted_path, true)?;
+        self_hosted.write_tick(&[1, 1], &[(42, &[1, 1])], 2)?;
+        self_hosted.finalize()?;
+        assert!(
+            source_wav_path(&self_hosted_path, 42).exists(),
+            "self-hosted source-stem behavior must remain available"
+        );
+        std::fs::remove_dir_all(test_dir)?;
+        Ok(())
     }
 
     #[cfg(feature = "discord")]
@@ -5344,10 +6529,15 @@ VALUES ('reservation-invalid', NULL, NULL, 'recording-invalid',
             r#"
 INSERT INTO call_scribe_hosted_capture_recovery
     (reservation_id, encrypted_lease_token, encryption_nonce, recording_id,
-     base_wav_path, reserved_seconds, started_at, expires_at, owner_instance_id)
+     base_wav_path, reserved_seconds, started_at, expires_at, owner_instance_id,
+     organization_id, guild_id, storage_provider, storage_destination_id,
+     storage_destination_revision, storage_allowed_host,
+     storage_object_key_prefix, transient_delete_policy)
 VALUES ('reservation-live', '\x01', '\x02', 'recording-live',
         '/captures/live.wav', 300, now() - interval '1 minute',
-        now() + interval '1 hour', 'instance-a')
+        now() + interval '1 hour', 'instance-a', 'org-test', '1',
+        'customer_s3', 'dst-test', 'rev-1', 'bucket.s3.us-east-1.amazonaws.com',
+        'objects/', 'delete_after_verified_delivery')
 "#,
         )
         .execute(&first)
@@ -5454,6 +6644,439 @@ WHERE reservation_id = 'reservation-live'
     }
 
     #[cfg(feature = "discord")]
+    #[tokio::test]
+    async fn hosted_finalization_atomically_hands_raw_audio_to_one_fenced_delivery_owner()
+    -> Result<()> {
+        let Some((admin, first, second, schema)) = isolated_test_pools().await? else {
+            eprintln!("CALL_SCRIBE_TEST_DATABASE_URL is unset; skipping Postgres delivery proof");
+            return Ok(());
+        };
+        migrate_runtime_schema(&first).await?;
+        let store = SqlxRuntimeStore {
+            pool: first.clone(),
+            organization_id: "org-delivery-test".to_string(),
+            capture_mode: CaptureMode::RecordOnly,
+        };
+        store.ensure_organization().await?;
+        let client = HostedControlPlaneClient::new(
+            "http://127.0.0.1:8080",
+            "test-token-with-at-least-thirty-two-bytes".to_string(),
+            "delivery-test-worker".to_string(),
+            "test-outbox-key-with-at-least-thirty-two-bytes".to_string(),
+        )?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let destination = HostedStorageDestination {
+            organization_id: "org-delivery-test".to_string(),
+            guild_id: "1".to_string(),
+            provider: "customer_s3".to_string(),
+            destination_id: "dst-test".to_string(),
+            destination_revision: "rev-1".to_string(),
+            allowed_host: "127.0.0.1".to_string(),
+            object_key_prefix: "objects/".to_string(),
+            transient_delete_policy: "delete_after_verified_delivery".to_string(),
+        };
+        let reservation = UsageReservation {
+            reservation_id: "reservation-delivery".to_string(),
+            lease_token: "opaque-delivery-lease-token".to_string(),
+            reserved_seconds: 300,
+            expires_at: (Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+        };
+        let test_dir =
+            std::env::temp_dir().join(format!("call-scribe-delivery-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir)?;
+        let wav_path = test_dir.join("capture.wav");
+        let mut writer = hound::WavWriter::create(&wav_path, discord_wav_spec())?;
+        for _ in 0..(u64::from(DISCORD_SAMPLE_RATE) * u64::from(DISCORD_CHANNELS)) {
+            writer.write_sample(0_i16)?;
+        }
+        writer.finalize()?;
+        let started_at = Local::now();
+        store
+            .persist_hosted_capture_recovery(
+                &client,
+                &reservation,
+                "recording-delivery",
+                &wav_path,
+                started_at,
+                "instance-a",
+                &destination,
+            )
+            .await?;
+        store
+            .record_session_started(
+                "recording-delivery",
+                GuildId::new(1),
+                ChannelId::new(2),
+                started_at,
+                "Delivery proof",
+                serde_json::json!({"hosted": true}),
+            )
+            .await?;
+        let (recovery_claim, authorization_end) = store
+            .claim_live_hosted_capture_finalization(
+                &reservation.reservation_id,
+                "recording-delivery",
+                "instance-a",
+                Utc::now() + chrono::Duration::seconds(5),
+            )
+            .await?;
+        let mut settlement_reservation = reservation.clone();
+        settlement_reservation.expires_at = authorization_end.to_rfc3339();
+        let manifests = hosted_artifact_manifests(std::slice::from_ref(&wav_path)).await?;
+        store
+            .finalize_hosted_capture_transaction(
+                &settlement_reservation,
+                "recording-delivery",
+                &recovery_claim,
+                1,
+                Utc::now(),
+                &destination,
+                &manifests,
+                Utc::now(),
+            )
+            .await?;
+
+        let counts: (i64, i64, i64, i64) = sqlx::query_as::query_as(
+            r#"
+SELECT
+  (SELECT count(*) FROM call_scribe_hosted_capture_recovery),
+  (SELECT count(*) FROM call_scribe_artifacts WHERE session_id = 'recording-delivery'),
+  (SELECT count(*) FROM call_scribe_hosted_artifact_delivery_outbox
+      WHERE recording_id = 'recording-delivery' AND status = 'pending'),
+  (SELECT count(*) FROM call_scribe_hosted_usage_outbox
+      WHERE recording_id = 'recording-delivery' AND status = 'pending')
+"#,
+        )
+        .fetch_one(&first)
+        .await?;
+        assert_eq!(counts, (0, 1, 1, 1));
+        assert!(
+            wav_path.exists(),
+            "local WAV must remain until a verified receipt"
+        );
+        let manifest_row: (String, String, String, String, i64, String) = sqlx::query_as::query_as(
+            r#"
+SELECT organization_id, guild_id, storage_destination_id,
+       storage_destination_revision, content_length, sha256
+FROM call_scribe_hosted_artifact_delivery_outbox
+WHERE recording_id = 'recording-delivery'
+"#,
+        )
+        .fetch_one(&first)
+        .await?;
+        assert_eq!(manifest_row.0, destination.organization_id);
+        assert_eq!(manifest_row.1, destination.guild_id);
+        assert_eq!(manifest_row.2, destination.destination_id);
+        assert_eq!(manifest_row.3, destination.destination_revision);
+        assert_eq!(manifest_row.4, i64::try_from(manifests[0].content_length)?);
+        assert_eq!(manifest_row.5, manifests[0].sha256);
+
+        async fn race_claim(pool: &PgPool, owner: &str, token: &str) -> Result<u64> {
+            Ok(sqlx::query::query(
+                r#"
+WITH candidate AS (
+    SELECT artifact_id
+    FROM call_scribe_hosted_artifact_delivery_outbox
+    WHERE status = 'pending'
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+UPDATE call_scribe_hosted_artifact_delivery_outbox AS delivery
+SET status = 'in_progress', claim_owner = $1, claim_token = $2,
+    claim_until = now() + interval '15 minutes', attempt_count = attempt_count + 1
+FROM candidate
+WHERE delivery.artifact_id = candidate.artifact_id
+"#,
+            )
+            .bind(owner)
+            .bind(token)
+            .execute(pool)
+            .await?
+            .rows_affected())
+        }
+        let (first_claim, second_claim) = tokio::join!(
+            race_claim(&first, "instance-a", "claim-a"),
+            race_claim(&second, "instance-b", "claim-b")
+        );
+        assert_eq!(
+            first_claim? + second_claim?,
+            1,
+            "only one replica may claim a job"
+        );
+        let wrong_fence = sqlx::query::query(
+            r#"
+UPDATE call_scribe_hosted_artifact_delivery_outbox
+SET operation_id = 'must-not-write'
+WHERE recording_id = 'recording-delivery' AND claim_token = 'wrong-claim'
+"#,
+        )
+        .execute(&second)
+        .await?;
+        assert_eq!(wrong_fence.rows_affected(), 0);
+
+        // Simulate the provider verification having committed while the
+        // worker lost the HTTP response/DB update. The next claim must verify
+        // the persisted operation first and must not call prepare or issue a
+        // second PUT.
+        sqlx::query::query(
+            r#"
+UPDATE call_scribe_hosted_artifact_delivery_outbox
+SET status = 'pending', claim_owner = NULL, claim_token = NULL, claim_until = NULL,
+    operation_id = 'op-verified', operation_generation = 7,
+    operation_object_key = 'objects/delivery.wav', next_attempt_at = now()
+WHERE recording_id = 'recording-delivery'
+"#,
+        )
+        .execute(&first)
+        .await?;
+        let unexpected_calls = Arc::new(AtomicU64::new(0));
+        let verify_calls = Arc::new(AtomicU64::new(0));
+        let verify_counter = verify_calls.clone();
+        let signed_at = DateTime::<Utc>::from_timestamp(Utc::now().timestamp(), 0)
+            .context("current timestamp must be valid")?;
+        let verification_expires_at = signed_at + chrono::Duration::minutes(5);
+        let verification_url = format!(
+            "http://{address}/objects/delivery.wav?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=test-access/{}/us-east-1/s3/aws4_request&X-Amz-Date={}&X-Amz-Expires=300&X-Amz-SignedHeaders=host;x-amz-checksum-mode&X-Amz-Signature={}",
+            signed_at.format("%Y%m%d"),
+            signed_at.format("%Y%m%dT%H%M%SZ"),
+            "0".repeat(64),
+        );
+        let checksum_bytes = manifests[0]
+            .sha256
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                u8::from_str_radix(std::str::from_utf8(pair).expect("hex must be UTF-8"), 16)
+                    .expect("manifest digest must be hex")
+            })
+            .collect::<Vec<_>>();
+        let provider_checksum = base64::engine::general_purpose::STANDARD.encode(checksum_bytes);
+        let receipt = serde_json::json!({
+            "receiptId": "receipt-verified",
+            "operationId": "op-verified",
+            "generation": 7,
+            "recordingId": "recording-delivery",
+            "artifactId": manifests[0].artifact_id,
+            "artifactKind": "raw_audio_wav",
+            "segmentIndex": manifests[0].segment_index,
+            "objectKey": "objects/delivery.wav",
+            "destinationId": destination.destination_id,
+            "destinationRevision": destination.destination_revision,
+            "provider": destination.provider,
+            "allowedUploadHost": destination.allowed_host,
+            "verified": true,
+            "contentLength": manifests[0].content_length,
+            "sha256": manifests[0].sha256,
+            "verifiedAt": Utc::now().to_rfc3339(),
+        });
+        let verification_response = serde_json::json!({
+            "receipt": receipt,
+            "verification": {
+                "url": verification_url,
+                "method": "HEAD",
+                "headers": {"x-amz-checksum-mode": "ENABLED"},
+                "expiresAt": verification_expires_at.to_rfc3339(),
+            }
+        });
+        let provider_content_length = manifests[0].content_length;
+        let provider_sha256 = manifests[0].sha256.clone();
+        let verify_app = axum::Router::new()
+            .route(
+                "/internal/v1/worker/artifact-deliveries/op-verified/verify",
+                axum::routing::post(move || {
+                    let verify_counter = verify_counter.clone();
+                    let verification_response = verification_response.clone();
+                    async move {
+                        verify_counter.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(verification_response)
+                    }
+                }),
+            )
+            .route(
+                "/objects/delivery.wav",
+                axum::routing::head(move || {
+                    let provider_checksum = provider_checksum.clone();
+                    let provider_sha256 = provider_sha256.clone();
+                    async move {
+                        axum::http::Response::builder()
+                            .status(axum::http::StatusCode::OK)
+                            .header(
+                                reqwest::header::CONTENT_LENGTH,
+                                provider_content_length.to_string(),
+                            )
+                            .header("x-amz-meta-callscribe-sha256", provider_sha256)
+                            .header("x-amz-checksum-sha256", provider_checksum)
+                            .body(axum::body::Body::empty())
+                            .expect("provider HEAD response must build")
+                    }
+                }),
+            )
+            .fallback({
+                let unexpected_calls = unexpected_calls.clone();
+                move || {
+                    let unexpected_calls = unexpected_calls.clone();
+                    async move {
+                        unexpected_calls.fetch_add(1, Ordering::SeqCst);
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }
+            });
+        let server = tokio::spawn(async move { axum::serve(listener, verify_app).await });
+        let retry_client = HostedControlPlaneClient::new(
+            &format!("http://{address}"),
+            "test-token-with-at-least-thirty-two-bytes".to_string(),
+            "delivery-retry-worker".to_string(),
+            "test-outbox-key-with-at-least-thirty-two-bytes".to_string(),
+        )?;
+        store
+            .retry_hosted_artifact_delivery_outbox(
+                &retry_client,
+                &test_dir,
+                "delivery-retry-worker",
+            )
+            .await?;
+        assert_eq!(verify_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(unexpected_calls.load(Ordering::SeqCst), 0);
+        let delivered: String = sqlx::query_scalar::query_scalar(
+            "SELECT status FROM call_scribe_hosted_artifact_delivery_outbox WHERE recording_id = 'recording-delivery'",
+        )
+        .fetch_one(&first)
+        .await?;
+        assert_eq!(delivered, "delivered");
+        assert!(
+            !wav_path.exists(),
+            "only the verified retry may delete local audio"
+        );
+        server.abort();
+
+        std::fs::remove_dir_all(&test_dir)?;
+        first.close().await;
+        second.close().await;
+        drop_test_schema(&admin, &schema).await?;
+        admin.close().await;
+        Ok(())
+    }
+
+    #[cfg(feature = "discord")]
+    #[tokio::test]
+    async fn zero_duration_hosted_capture_closes_without_delivery_or_backpressure() -> Result<()> {
+        let Some((admin, pool, _second, schema)) = isolated_test_pools().await? else {
+            eprintln!("CALL_SCRIBE_TEST_DATABASE_URL is unset; skipping zero-duration proof");
+            return Ok(());
+        };
+        migrate_runtime_schema(&pool).await?;
+        let store = SqlxRuntimeStore {
+            pool: pool.clone(),
+            organization_id: "org-zero-test".to_string(),
+            capture_mode: CaptureMode::RecordOnly,
+        };
+        store.ensure_organization().await?;
+        let client = HostedControlPlaneClient::new(
+            "http://127.0.0.1:8080",
+            "test-token-with-at-least-thirty-two-bytes".to_string(),
+            "zero-test-worker".to_string(),
+            "test-outbox-key-with-at-least-thirty-two-bytes".to_string(),
+        )?;
+        let destination = HostedStorageDestination {
+            organization_id: "org-zero-test".to_string(),
+            guild_id: "1".to_string(),
+            provider: "customer_s3".to_string(),
+            destination_id: "dst-zero".to_string(),
+            destination_revision: "rev-1".to_string(),
+            allowed_host: "bucket.s3.us-east-1.amazonaws.com".to_string(),
+            object_key_prefix: "objects/".to_string(),
+            transient_delete_policy: "delete_after_verified_delivery".to_string(),
+        };
+        let reservation = UsageReservation {
+            reservation_id: "reservation-zero".to_string(),
+            lease_token: "opaque-zero-duration-lease-token".to_string(),
+            reserved_seconds: 300,
+            expires_at: (Utc::now() + chrono::Duration::minutes(1)).to_rfc3339(),
+        };
+        let test_dir = std::env::temp_dir().join(format!("call-scribe-zero-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir)?;
+        let wav_path = test_dir.join("zero.wav");
+        hound::WavWriter::create(&wav_path, discord_wav_spec())?.finalize()?;
+        let started_at = Local::now();
+        store
+            .persist_hosted_capture_recovery(
+                &client,
+                &reservation,
+                "recording-zero",
+                &wav_path,
+                started_at,
+                "instance-a",
+                &destination,
+            )
+            .await?;
+        store
+            .record_session_started(
+                "recording-zero",
+                GuildId::new(1),
+                ChannelId::new(2),
+                started_at,
+                "Zero duration proof",
+                serde_json::json!({"hosted": true}),
+            )
+            .await?;
+        let (claim_token, _) = store
+            .claim_live_hosted_capture_finalization(
+                &reservation.reservation_id,
+                "recording-zero",
+                "instance-a",
+                Utc::now() + chrono::Duration::seconds(5),
+            )
+            .await?;
+        store
+            .finalize_zero_duration_hosted_capture_transaction(
+                &reservation,
+                "recording-zero",
+                &claim_token,
+                &destination,
+                std::slice::from_ref(&wav_path),
+                Utc::now(),
+            )
+            .await?;
+        let counts: (i64, i64, i64, i64) = sqlx::query_as::query_as(
+            r#"
+SELECT
+  (SELECT count(*) FROM call_scribe_hosted_capture_recovery),
+  (SELECT count(*) FROM call_scribe_hosted_usage_outbox),
+  (SELECT count(*) FROM call_scribe_artifacts WHERE session_id = 'recording-zero'),
+  (SELECT count(*) FROM call_scribe_hosted_artifact_delivery_outbox
+      WHERE recording_id = 'recording-zero')
+"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(counts, (0, 0, 0, 0));
+        assert!(
+            !store
+                .has_unsafe_hosted_deliveries("org-zero-test", "1", Duration::ZERO)
+                .await?
+        );
+        store.finish_zero_duration_hosted_cleanup(&test_dir).await?;
+        store.finish_zero_duration_hosted_cleanup(&test_dir).await?;
+        assert!(
+            !wav_path.exists(),
+            "header-only WAV must be removed idempotently"
+        );
+        let cleanup_count: i64 = sqlx::query_scalar::query_scalar(
+            "SELECT count(*) FROM call_scribe_hosted_zero_duration_cleanup_outbox",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(cleanup_count, 0);
+
+        std::fs::remove_dir_all(test_dir)?;
+        pool.close().await;
+        drop_test_schema(&admin, &schema).await?;
+        admin.close().await;
+        Ok(())
+    }
+
+    #[cfg(feature = "discord")]
     #[test]
     fn missing_or_failed_heartbeat_self_fences_only_unowned_guilds() {
         let expected = vec![
@@ -5537,6 +7160,16 @@ WHERE reservation_id = 'reservation-live'
             reserved_seconds: 300,
             expires_at: initial_expiry.to_rfc3339(),
         };
+        let destination = HostedStorageDestination {
+            organization_id: "org-test".to_string(),
+            guild_id: "1".to_string(),
+            provider: "customer_s3".to_string(),
+            destination_id: "dst-test".to_string(),
+            destination_revision: "rev-1".to_string(),
+            allowed_host: "bucket.s3.us-east-1.amazonaws.com".to_string(),
+            object_key_prefix: "objects/".to_string(),
+            transient_delete_policy: "delete_after_verified_delivery".to_string(),
+        };
         let base_wav_path = Path::new("/captures/shortened.wav");
         store
             .persist_hosted_capture_recovery(
@@ -5546,6 +7179,7 @@ WHERE reservation_id = 'reservation-live'
                 base_wav_path,
                 started_at.with_timezone(&Local),
                 "instance-a",
+                &destination,
             )
             .await?;
 

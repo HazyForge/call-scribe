@@ -341,6 +341,7 @@ dependencies = [
  "sqlx-core",
  "sqlx-postgres",
  "tokio",
+ "tokio-util",
  "tower-http",
  "tracing",
  "urlencoding",
